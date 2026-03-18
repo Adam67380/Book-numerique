@@ -12,6 +12,42 @@ from .base import JobAPIClient, JobOffer
 
 AUTH_URL = "https://entreprise.francetravail.fr/connexion/oauth2/access_token"
 API_BASE = "https://api.francetravail.io/partenaire/offresdemploi/v2"
+GEO_API = "https://geo.api.gouv.fr"
+
+# Codes département pour les grandes villes
+VILLE_DEPARTEMENTS = {
+    "paris": "75",
+    "marseille": "13",
+    "lyon": "69",
+    "toulouse": "31",
+    "nice": "06",
+    "nantes": "44",
+    "strasbourg": "67",
+    "montpellier": "34",
+    "bordeaux": "33",
+    "lille": "59",
+    "rennes": "35",
+    "reims": "51",
+    "toulon": "83",
+    "grenoble": "38",
+    "dijon": "21",
+    "angers": "49",
+    "nimes": "30",
+    "clermont-ferrand": "63",
+    "tours": "37",
+    "amiens": "80",
+    "metz": "57",
+    "rouen": "76",
+    "nancy": "54",
+    "orleans": "45",
+    "mulhouse": "68",
+    "caen": "14",
+    "perpignan": "66",
+    "brest": "29",
+    "limoges": "87",
+    "besancon": "25",
+    "poitiers": "86",
+}
 
 
 class FranceTravailClient(JobAPIClient):
@@ -50,6 +86,36 @@ class FranceTravailClient(JobAPIClient):
         self.authenticate()
         return {"Authorization": f"Bearer {self.access_token}"}
 
+    def _resolve_location(self, location: str) -> dict:
+        """Résout un nom de ville en paramètres API (commune ou département)."""
+        loc_lower = location.lower().strip()
+
+        # Si c'est un code département (ex: "75", "67")
+        if loc_lower.isdigit() and len(loc_lower) <= 3:
+            return {"departement": loc_lower}
+
+        # Vérifier la table des grandes villes
+        if loc_lower in VILLE_DEPARTEMENTS:
+            return {"departement": VILLE_DEPARTEMENTS[loc_lower]}
+
+        # Essayer l'API geo.gouv.fr pour obtenir le code commune
+        try:
+            resp = requests.get(
+                f"{GEO_API}/communes",
+                params={"nom": location, "limit": 1, "fields": "code,nom,codeDepartement"},
+                timeout=10,
+                verify=False,
+            )
+            if resp.ok:
+                results = resp.json()
+                if results:
+                    return {"commune": results[0]["code"]}
+        except Exception:
+            pass
+
+        # Fallback : utiliser comme mot-clé dans la recherche
+        return {}
+
     def search(self, keywords: str, location: str = "", radius_km: int = 30,
                limit: int = 20) -> list[JobOffer]:
         """Recherche d'offres via l'API France Travail."""
@@ -58,8 +124,14 @@ class FranceTravailClient(JobAPIClient):
             "range": f"0-{min(limit, 149)}",
         }
         if location:
-            params["commune"] = location
-            params["distance"] = radius_km
+            loc_params = self._resolve_location(location)
+            if loc_params:
+                params.update(loc_params)
+                if "commune" in loc_params:
+                    params["distance"] = radius_km
+            else:
+                # Ajouter la ville aux mots-clés si non résolue
+                params["motsCles"] = f"{keywords} {location}"
 
         resp = requests.get(
             f"{API_BASE}/offres/search",
