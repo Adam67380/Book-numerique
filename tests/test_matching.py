@@ -11,6 +11,7 @@ from job_agent.matching import (
     score_experience,
     score_salaire,
     score_contrat,
+    score_titre,
     parse_experience_years,
 )
 
@@ -49,6 +50,7 @@ SAMPLE_PROFILE = {
     "salaire_min": 35000,
     "salaire_max": 50000,
     "types_contrat": ["CDI", "CDD", "VIE"],
+    "mots_cles": "digital analytics UX data analyst customer experience",
 }
 
 
@@ -93,7 +95,39 @@ class TestScoreCompetences(unittest.TestCase):
     def test_empty_requirements(self):
         offer = make_offer(competences_requises=[])
         score, _, _ = score_competences(SAMPLE_PROFILE, offer)
-        self.assertEqual(score, 1.0)
+        self.assertEqual(score, 0.5)  # Neutre quand pas d'info
+
+
+class TestScoreTitre(unittest.TestCase):
+    def test_relevant_title(self):
+        """Un titre 'Data Analyst' doit matcher le profil data analyst."""
+        offer = make_offer(titre="Data Analyst")
+        score = score_titre(SAMPLE_PROFILE, offer)
+        self.assertGreaterEqual(score, 0.85)
+
+    def test_irrelevant_title(self):
+        """Un titre hors-sujet doit avoir un score très bas."""
+        offer = make_offer(titre="Directeur Développement des ventes")
+        score = score_titre(SAMPLE_PROFILE, offer)
+        self.assertLessEqual(score, 0.2)
+
+    def test_partially_relevant(self):
+        """Un titre partiellement pertinent doit avoir un score moyen."""
+        offer = make_offer(titre="Chef de projet digital")
+        score = score_titre(SAMPLE_PROFILE, offer)
+        self.assertGreaterEqual(score, 0.5)
+
+    def test_poseur_signaletique(self):
+        """POSEUR SIGNALÉTIQUE ne doit pas matcher un profil data analyst."""
+        offer = make_offer(titre="POSEUR SIGNALÉTIQUE")
+        score = score_titre(SAMPLE_PROFILE, offer)
+        self.assertLessEqual(score, 0.2)
+
+    def test_executive_assistant(self):
+        """Executive Assistant ne doit pas matcher un profil data analyst."""
+        offer = make_offer(titre="Executive Assistant bilingue")
+        score = score_titre(SAMPLE_PROFILE, offer)
+        self.assertLessEqual(score, 0.2)
 
 
 class TestScoreLocalisation(unittest.TestCase):

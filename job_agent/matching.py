@@ -36,11 +36,12 @@ SKILL_SYNONYMS = {
 
 # Poids de chaque composante du score (total = 100)
 WEIGHTS = {
-    "competences": 40,
+    "titre": 25,
+    "competences": 30,
     "localisation": 15,
-    "experience": 15,
-    "formation": 10,
-    "salaire": 10,
+    "experience": 10,
+    "formation": 5,
+    "salaire": 5,
     "contrat": 10,
 }
 
@@ -68,6 +69,61 @@ def expand_synonyms(skill: str) -> set[str]:
             result.add(norm_key)
             result.add(norm_value)
     return result
+
+
+def score_titre(profile: dict, offer: JobOffer) -> float:
+    """Score de pertinence du titre de l'offre par rapport au profil.
+
+    Compare le titre de l'offre avec les mots-clés du profil pour
+    filtrer les postes hors-sujet (ex: Directeur, Poseur signalétique).
+    """
+    titre_norm = normalize_text(offer.titre)
+    if not titre_norm:
+        return 0.3
+
+    # Construire la liste de mots-clés pertinents depuis le profil
+    mots_cles_raw = profile.get("mots_cles", "")
+    keywords = set()
+    if mots_cles_raw:
+        for mot in mots_cles_raw.lower().split():
+            mot = mot.strip()
+            if len(mot) >= 2:
+                keywords.add(normalize_text(mot))
+
+    # Ajouter les compétences clés du profil (celles >= 3 caractères)
+    for skill in profile.get("competences", []):
+        norm = normalize_text(skill)
+        if len(norm) >= 3:
+            keywords.add(norm)
+
+    if not keywords:
+        return 0.5
+
+    # Compter combien de mots-clés apparaissent dans le titre
+    matches = 0
+    for kw in keywords:
+        # Vérifier présence dans le titre
+        if kw in titre_norm:
+            matches += 1
+        else:
+            # Vérifier aussi via synonymes
+            kw_variants = expand_synonyms(kw)
+            for variant in kw_variants:
+                if variant in titre_norm:
+                    matches += 1
+                    break
+
+    if matches == 0:
+        # Aucun mot-clé dans le titre → probablement hors-sujet
+        return 0.1
+
+    # Score progressif : 1 match = 0.5, 2+ = 0.75+, 3+ = 0.9+
+    if matches >= 3:
+        return 1.0
+    elif matches == 2:
+        return 0.85
+    else:
+        return 0.55
 
 
 def skill_matches(profile_skill: str, offer_skill: str) -> bool:
@@ -100,7 +156,7 @@ def skill_matches(profile_skill: str, offer_skill: str) -> bool:
 def score_competences(profile: dict, offer: JobOffer) -> tuple[float, list[str], list[str]]:
     """Score de matching des compétences. Retourne (score, matched, gaps)."""
     if not offer.competences_requises:
-        return 1.0, [], []
+        return 0.5, [], []  # Pas d'info → score neutre (pas parfait)
 
     profile_skills = profile.get("competences", [])
     matched = []
@@ -131,7 +187,7 @@ def score_localisation(profile: dict, offer: JobOffer) -> float:
     offer_loc = normalize_text(offer.localisation)
 
     if not desired or not offer_loc:
-        return 0.7  # Neutre si pas d'info
+        return 0.5  # Neutre si pas d'info
 
     if desired in offer_loc or offer_loc in desired:
         return 1.0
@@ -158,7 +214,7 @@ def score_experience(profile: dict, offer: JobOffer) -> tuple[float, str]:
     required = parse_experience_years(offer.experience_requise)
 
     if required is None:
-        return 0.8, ""  # Pas d'info
+        return 0.5, ""  # Pas d'info
 
     if profile_years >= required:
         return 1.0, ""
@@ -174,7 +230,7 @@ def score_formation(profile: dict, offer: JobOffer) -> tuple[float, str]:
     profile_level = profile.get("formation_niveau", 0)
 
     if not offer.formation_requise:
-        return 0.8, ""
+        return 0.5, ""
 
     # Chercher le niveau dans le texte de l'offre
     offer_text = offer.formation_requise.lower()
@@ -184,7 +240,7 @@ def score_formation(profile: dict, offer: JobOffer) -> tuple[float, str]:
             offer_level = max(offer_level, level)
 
     if offer_level == 0:
-        return 0.8, ""
+        return 0.5, ""
 
     if profile_level >= offer_level:
         return 1.0, ""
@@ -201,10 +257,10 @@ def score_salaire(profile: dict, offer: JobOffer) -> float:
     o_max = offer.salaire_max
 
     if not o_min and not o_max:
-        return 0.7  # Pas d'info salaire
+        return 0.5  # Pas d'info salaire
 
     if not p_min and not p_max:
-        return 0.7
+        return 0.5
 
     # Vérifier le chevauchement des fourchettes
     p_min = p_min or 0
@@ -226,7 +282,7 @@ def score_contrat(profile: dict, offer: JobOffer) -> float:
     """Score de correspondance du type de contrat."""
     desired = [c.upper() for c in profile.get("types_contrat", [])]
     if not desired or not offer.type_contrat:
-        return 0.7
+        return 0.5
 
     if offer.type_contrat.upper() in desired:
         return 1.0
@@ -243,6 +299,9 @@ def compute_match(profile: dict, offer: JobOffer) -> dict:
         - matched_skills: compétences matchées
         - tips: conseils liés aux écarts
     """
+    # Pertinence du titre
+    tit_score = score_titre(profile, offer)
+
     # Compétences
     comp_score, matched_skills, skill_gaps = score_competences(profile, offer)
 
@@ -263,7 +322,8 @@ def compute_match(profile: dict, offer: JobOffer) -> dict:
 
     # Score pondéré
     weighted = (
-        comp_score * WEIGHTS["competences"]
+        tit_score * WEIGHTS["titre"]
+        + comp_score * WEIGHTS["competences"]
         + loc_score * WEIGHTS["localisation"]
         + exp_score * WEIGHTS["experience"]
         + edu_score * WEIGHTS["formation"]
@@ -273,6 +333,8 @@ def compute_match(profile: dict, offer: JobOffer) -> dict:
 
     # Construire les tips
     tips = []
+    if tit_score < 0.5:
+        tips.append("⚠ Le titre du poste ne correspond pas bien à votre profil")
     if skill_gaps:
         tips.append(f"Compétences manquantes : {', '.join(skill_gaps)}")
     if exp_tip:
@@ -283,6 +345,7 @@ def compute_match(profile: dict, offer: JobOffer) -> dict:
     return {
         "score": round(weighted, 1),
         "details": {
+            "titre": round(tit_score * 100, 1),
             "competences": round(comp_score * 100, 1),
             "localisation": round(loc_score * 100, 1),
             "experience": round(exp_score * 100, 1),
