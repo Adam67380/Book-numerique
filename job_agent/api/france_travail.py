@@ -2,7 +2,11 @@
 
 import re
 import time
+import urllib3
 import requests
+
+# Désactiver les avertissements SSL pour les réseaux d'entreprise
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from .base import JobAPIClient, JobOffer
 
@@ -35,6 +39,7 @@ class FranceTravailClient(JobAPIClient):
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=15,
+            verify=False,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -61,6 +66,7 @@ class FranceTravailClient(JobAPIClient):
             params=params,
             headers=self._headers(),
             timeout=20,
+            verify=False,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -73,6 +79,7 @@ class FranceTravailClient(JobAPIClient):
             f"{API_BASE}/offres/{offer_id}",
             headers=self._headers(),
             timeout=15,
+            verify=False,
         )
         resp.raise_for_status()
         return self._parse_offer(resp.json())
