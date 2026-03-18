@@ -108,18 +108,52 @@ def cmd_search(args):
 
     client = FranceTravailClient(client_id, client_secret)
 
-    print(f"\n  Recherche d'offres : '{keywords}' à {location or 'toute la France'}...")
+    # Découper les mots-clés en sous-recherches pour maximiser les résultats
+    search_terms = [kw.strip() for kw in keywords.split() if len(kw.strip()) > 2]
+    # Grouper par 2-3 mots et aussi chercher des termes individuels importants
+    search_queries = []
+    # Recherche complète d'abord
+    search_queries.append(keywords)
+    # Puis des sous-groupes de 2 mots
+    for i in range(0, len(search_terms), 2):
+        group = " ".join(search_terms[i:i+2])
+        if group != keywords:
+            search_queries.append(group)
+    # Termes individuels importants
+    for term in search_terms:
+        if len(term) >= 4 and term not in search_queries:
+            search_queries.append(term)
 
-    try:
-        offers = client.search(
-            keywords=keywords,
-            location=location,
-            radius_km=profile.get("rayon_km", 30),
-            limit=limit,
-        )
-    except Exception as e:
-        print(f"\nErreur lors de la recherche : {e}")
-        sys.exit(1)
+    # Dédupliquer
+    seen_queries = []
+    for q in search_queries:
+        if q not in seen_queries:
+            seen_queries.append(q)
+    search_queries = seen_queries[:8]  # Max 8 requêtes
+
+    print(f"\n  Recherche d'offres à {location or 'toute la France'}...")
+    print(f"  Termes de recherche : {', '.join(search_queries)}")
+
+    offers = []
+    seen_ids = set()
+    for query in search_queries:
+        try:
+            batch = client.search(
+                keywords=query,
+                location=location,
+                radius_km=profile.get("rayon_km", 30),
+                limit=limit,
+            )
+            for offer in batch:
+                if offer.id not in seen_ids:
+                    seen_ids.add(offer.id)
+                    offers.append(offer)
+            if batch:
+                print(f"    '{query}' → {len(batch)} offre(s)")
+        except Exception as e:
+            print(f"    '{query}' → Erreur : {e}")
+
+    print(f"\n  Total : {len(offers)} offre(s) unique(s) trouvée(s)")
 
     # Calculer le matching
     results = []
