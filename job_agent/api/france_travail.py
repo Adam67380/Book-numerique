@@ -77,10 +77,18 @@ class FranceTravailClient(JobAPIClient):
             timeout=15,
             verify=False,
         )
-        resp.raise_for_status()
-        data = resp.json()
+        if not resp.ok:
+            print(f"  Erreur authentification ({resp.status_code}): {resp.text[:200]}")
+            resp.raise_for_status()
+
+        try:
+            data = resp.json()
+        except ValueError:
+            raise RuntimeError(f"Réponse auth invalide (status {resp.status_code}): {resp.text[:200]}")
+
         self.access_token = data["access_token"]
         self.token_expiry = time.time() + data.get("expires_in", 1500) - 60
+        print("  Authentification France Travail OK.")
 
     def _headers(self) -> dict:
         self.authenticate()
@@ -133,15 +141,27 @@ class FranceTravailClient(JobAPIClient):
                 # Ajouter la ville aux mots-clés si non résolue
                 params["motsCles"] = f"{keywords} {location}"
 
+        headers = self._headers()
         resp = requests.get(
             f"{API_BASE}/offres/search",
             params=params,
-            headers=self._headers(),
+            headers=headers,
             timeout=20,
             verify=False,
         )
         resp.raise_for_status()
-        data = resp.json()
+
+        # Gérer les réponses vides (204 No Content ou body vide)
+        if resp.status_code == 204 or not resp.text.strip():
+            print("  Aucune offre trouvée pour ces critères.")
+            return []
+
+        try:
+            data = resp.json()
+        except ValueError:
+            print(f"  Réponse inattendue de l'API (status {resp.status_code}): {resp.text[:200]}")
+            return []
+
         results = data.get("resultats", [])
         return [self._parse_offer(r) for r in results]
 
