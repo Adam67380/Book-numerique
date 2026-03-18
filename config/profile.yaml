@@ -1,0 +1,65 @@
+# Profil d'Adam GARANT - Généré depuis CV
+nom: "Adam GARANT"
+
+competences:
+  - contentsquare
+  - google analytics 4
+  - ga4
+  - power bi
+  - sql
+  - google tag manager
+  - gtm
+  - python
+  - pandas
+  - numpy
+  - n8n
+  - ux design
+  - expérience utilisateur
+  - data visualization
+  - web analytics
+  - intelligence artificielle
+  - agile
+  - jira
+  - microsoft planner
+  - klaxoon
+  - magento
+  - matomo
+  - google ads
+  - bing ads
+  - criteo
+  - algolia
+  - ab testing
+  - pilotage de projet
+  - gestion de sprint
+  - analyse de données
+
+experience_annees: 3
+
+formation: "master"
+
+langues:
+  - francais
+  - anglais
+
+localisation: "Paris"
+localisations_secondaires:
+  - "Strasbourg"
+  - "International"
+rayon_km: 50
+ouvert_international: true
+preference_grandes_entreprises: true
+
+salaire_min: 35000
+salaire_max: 50000
+
+types_contrat:
+  - CDI
+  - CDD
+  - VIE
+
+mots_cles: "digital analytics UX data analyst customer experience"
+
+api:
+  france_travail:
+    client_id: ""
+    client_secret: ""

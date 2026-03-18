@@ -1,0 +1,44 @@
+# === Profil Candidat - Agent de Matching ===
+# Copiez ce fichier en config/profile.yaml et remplissez vos informations
+
+nom: "Jean Dupont"
+
+# Compétences techniques et non-techniques
+competences:
+  - python
+  - sql
+  - machine learning
+  - docker
+  - gestion de projet
+
+# Années d'expérience professionnelle
+experience_annees: 5
+
+# Niveau d'études : bac, bac+2, bac+3, master, doctorat
+formation: "master"
+
+# Langues parlées
+langues:
+  - francais
+  - anglais
+
+# Ville ou département souhaité
+localisation: "Paris"
+rayon_km: 30
+
+# Fourchette salariale annuelle brute (EUR)
+salaire_min: 35000
+salaire_max: 50000
+
+# Types de contrat souhaités : CDI, CDD, interim, freelance, alternance
+types_contrat:
+  - CDI
+
+# Mots-clés pour la recherche d'offres
+mots_cles: "développeur python"
+
+# === Clés API ===
+api:
+  france_travail:
+    client_id: ""
+    client_secret: ""
