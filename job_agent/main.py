@@ -1,6 +1,7 @@
 """CLI principal de l'agent de matching d'offres d'emploi."""
 
 import argparse
+import os
 import sys
 
 from job_agent.profile import load_profile, create_profile_interactive, PROFILE_PATH
@@ -94,14 +95,14 @@ def cmd_search(args):
         print("Erreur : spécifiez des mots-clés avec --keywords ou dans votre profil.")
         sys.exit(1)
 
-    # Initialiser le client API
+    # Initialiser le client API (profil YAML prioritaire, .env en fallback)
     api_config = profile.get("api", {}).get("france_travail", {})
-    client_id = api_config.get("client_id", "")
-    client_secret = api_config.get("client_secret", "")
+    client_id = api_config.get("client_id", "") or os.environ.get("FRANCE_TRAVAIL_CLIENT_ID", "")
+    client_secret = api_config.get("client_secret", "") or os.environ.get("FRANCE_TRAVAIL_CLIENT_SECRET", "")
 
     if not client_id or not client_secret:
-        print("Erreur : clés API France Travail manquantes dans votre profil.")
-        print("Renseignez client_id et client_secret dans config/profile.yaml")
+        print("Erreur : clés API France Travail manquantes.")
+        print("Renseignez-les dans config/profile.yaml ou dans un fichier .env")
         print("Inscription gratuite : https://francetravail.io/data/api/offres-emploi")
         sys.exit(1)
 
@@ -161,8 +162,8 @@ def cmd_tips(args):
     profile = load_profile(args.profile)
 
     api_config = profile.get("api", {}).get("france_travail", {})
-    client_id = api_config.get("client_id", "")
-    client_secret = api_config.get("client_secret", "")
+    client_id = api_config.get("client_id", "") or os.environ.get("FRANCE_TRAVAIL_CLIENT_ID", "")
+    client_secret = api_config.get("client_secret", "") or os.environ.get("FRANCE_TRAVAIL_CLIENT_SECRET", "")
 
     if not client_id or not client_secret:
         print("Erreur : clés API France Travail manquantes.")
