@@ -41,100 +41,115 @@ _session.headers.update({
 # ──────────────────────────────────────────────────────────────────────
 
 def _search_indeed(keywords: str, location: str, limit: int = 10) -> list[dict]:
-    """Recherche directe sur Indeed.fr."""
+    """Recherche Indeed via flux RSS (le HTML bloque le scraping)."""
     results = []
     try:
+        # Le flux RSS d'Indeed n'est pas bloqué contrairement au HTML
         resp = _session.get(
-            "https://fr.indeed.com/jobs",
-            params={"q": keywords, "l": location, "sort": "date", "limit": limit},
+            "https://fr.indeed.com/rss",
+            params={"q": keywords, "l": location, "sort": "date"},
             timeout=15,
         )
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(resp.text, "xml")
 
-        # Indeed utilise des divs avec data-jk pour les offres
-        for card in soup.select("div.job_seen_beacon, div.jobsearch-ResultsList > div"):
-            title_el = card.select_one("h2.jobTitle a, a.jcs-JobTitle")
-            company_el = card.select_one("span[data-testid='company-name'], span.companyName")
-            location_el = card.select_one("div[data-testid='text-location'], div.companyLocation")
-            snippet_el = card.select_one("div.job-snippet, td.snip")
-            date_el = card.select_one("span.date, span[data-testid='myJobsStateDate']")
+        for item in soup.find_all("item")[:limit]:
+            title = item.find("title")
+            link = item.find("link")
+            desc = item.find("description")
+            pub_date = item.find("pubDate")
 
-            if not title_el:
+            if not title or not link:
                 continue
 
-            href = title_el.get("href", "")
-            if href and not href.startswith("http"):
-                href = "https://fr.indeed.com" + href
+            snippet = ""
+            if desc:
+                # Nettoyer le HTML de la description
+                desc_soup = BeautifulSoup(desc.get_text(), "html.parser")
+                snippet = desc_soup.get_text(strip=True)[:300]
+            if pub_date:
+                snippet = f"[{pub_date.get_text(strip=True)}] {snippet}"
 
             results.append({
-                "title": title_el.get_text(strip=True),
-                "url": href,
-                "snippet": (
-                    (company_el.get_text(strip=True) + " — " if company_el else "")
-                    + (location_el.get_text(strip=True) + " — " if location_el else "")
-                    + (snippet_el.get_text(strip=True) if snippet_el else "")
-                    + (" — " + date_el.get_text(strip=True) if date_el else "")
-                ),
+                "title": title.get_text(strip=True),
+                "url": link.get_text(strip=True),
+                "snippet": snippet,
                 "platform": "indeed",
             })
-            if len(results) >= limit:
-                break
 
     except Exception as e:
-        print(f"    Indeed : {e}")
+        print(f"    Indeed RSS : {e}")
 
     return results
 
 
 def _search_wttj(keywords: str, location: str, limit: int = 10) -> list[dict]:
-    """Recherche via l'API WTTJ (Welcome to the Jungle)."""
+    """Recherche WTTJ via leur API Algolia (publique)."""
     results = []
+
+    # Essayer l'API Algolia de WTTJ (endpoint public utilisé par leur frontend)
     try:
-        # WTTJ a une API publique de recherche
-        resp = _session.get(
-            "https://api.welcometothejungle.com/api/v1/jobs",
+        resp = _session.post(
+            "https://csekhvms53-dsn.algolia.net/1/indexes/wttj_jobs_production_fr/query",
             params={
+                "x-algolia-application-id": "CSEKHVMS53",
+                "x-algolia-api-key": "YjViMmIxNjkwNjYzNWViNzRkMjRiOGZhYTRlZDBiZjI2MTgyNGQ5MGUyYTljMGIwMTE3ZTgxYjk2ZWVlYjEwYnRhZ0ZpbHRlcnM9",
+            },
+            json={
                 "query": keywords,
-                "page": 1,
-                "per_page": limit,
-                "aroundLatLng": "",
-                "contract_type[]": "full-time",
+                "hitsPerPage": limit,
+                "facetFilters": [
+                    [f"office.city:{location}"] if location else [],
+                ],
             },
             headers={
                 "Accept": "application/json",
-                "x-wttj-gateway": "default",
+                "Content-Type": "application/json",
             },
             timeout=15,
         )
+
         if resp.status_code == 200:
             data = resp.json()
-            for job in data.get("jobs", data.get("results", [])):
-                name = job.get("name", "")
-                org = job.get("organization", {})
+            for hit in data.get("hits", []):
+                name = hit.get("name", "")
+                org = hit.get("organization", {})
                 company = org.get("name", "Inconnue")
-                office = job.get("office", {})
-                city = office.get("city", location)
-                contract = job.get("contract_type", {})
+                office = hit.get("office", {})
+                city = office.get("city", location) if isinstance(office, dict) else location
+                contract = hit.get("contract_type", {})
+                contract_label = contract.get("fr", str(contract)) if isinstance(contract, dict) else str(contract)
+                published = hit.get("published_at", "")
+
+                org_slug = org.get("slug", "") if isinstance(org, dict) else ""
+                job_slug = hit.get("slug", hit.get("reference", ""))
+
+                url = f"https://www.welcometothejungle.com/fr/companies/{org_slug}/jobs/{job_slug}"
+
+                # Description nettoyée
+                desc = hit.get("description", "") or ""
+                desc_clean = BeautifulSoup(desc, "html.parser").get_text(strip=True)[:200] if desc else ""
+
+                snippet = f"{company} — {city} — {contract_label}"
+                if published:
+                    snippet += f" — Publié: {published[:10]}"
+                if desc_clean:
+                    snippet += f" — {desc_clean}"
 
                 results.append({
                     "title": name,
-                    "url": f"https://www.welcometothejungle.com/fr/companies/{org.get('slug', '')}/jobs/{job.get('slug', '')}",
-                    "snippet": (
-                        f"{company} — {city} — "
-                        f"{contract.get('fr', '') if isinstance(contract, dict) else contract} — "
-                        f"{job.get('description', '')[:200]}"
-                    ),
+                    "url": url,
+                    "snippet": snippet,
                     "platform": "wttj",
                 })
-                if len(results) >= limit:
-                    break
-        else:
-            # Fallback : scraper la page HTML de WTTJ
-            results = _search_wttj_html(keywords, location, limit)
 
     except Exception as e:
-        print(f"    WTTJ API : {e}")
+        print(f"    WTTJ Algolia : {e}")
+        # Fallback : page HTML
+        results = _search_wttj_html(keywords, location, limit)
+
+    # Si Algolia n'a rien retourné, essayer HTML
+    if not results:
         results = _search_wttj_html(keywords, location, limit)
 
     return results
@@ -152,22 +167,23 @@ def _search_wttj_html(keywords: str, location: str, limit: int = 10) -> list[dic
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        for card in soup.select("li[data-testid='search-results-list-item-wrapper'], div[role='listitem']"):
-            link = card.select_one("a[href*='/jobs/']")
-            if not link:
-                continue
+        # Chercher les liens vers des offres individuelles
+        for link in soup.select("a[href*='/jobs/']"):
             href = link.get("href", "")
+            if "/companies/" not in href:
+                continue
             if not href.startswith("http"):
                 href = "https://www.welcometothejungle.com" + href
-            text = card.get_text(separator=" — ", strip=True)
-            results.append({
-                "title": link.get_text(strip=True)[:100],
-                "url": href,
-                "snippet": text[:300],
-                "platform": "wttj",
-            })
-            if len(results) >= limit:
-                break
+            title = link.get_text(strip=True)
+            if title and len(title) > 3:
+                results.append({
+                    "title": title[:100],
+                    "url": href,
+                    "snippet": "",
+                    "platform": "wttj",
+                })
+                if len(results) >= limit:
+                    break
 
     except Exception as e:
         print(f"    WTTJ HTML : {e}")
