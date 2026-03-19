@@ -9,6 +9,7 @@ from job_agent.api.france_travail import FranceTravailClient
 from job_agent.api.base import JobOffer
 from job_agent.matching import compute_match
 from job_agent.interview import generate_tips
+from job_agent.web_search import web_search_jobs, offers_to_job_offers
 
 
 def display_results(results: list[dict]):
@@ -257,6 +258,82 @@ def cmd_tips(args):
     print(tips)
 
 
+def cmd_web_search(args):
+    """Commande de recherche web multi-plateformes avec filtrage IA."""
+    profile = load_profile(args.profile)
+    keywords = args.keywords or profile.get("mots_cles", "")
+    location = args.location or profile.get("localisation", "")
+
+    if not keywords:
+        print("Erreur : spécifiez des mots-clés avec --keywords ou dans votre profil.")
+        sys.exit(1)
+
+    # Plateformes à chercher
+    platforms = None
+    if args.platforms:
+        platforms = [p.strip() for p in args.platforms.split(",")]
+
+    print(f"\n  Recherche web : \"{keywords}\" à {location or 'toute la France'}")
+    print(f"  Plateformes : {', '.join(platforms or ['indeed', 'wttj', 'apec', 'linkedin', 'hellowork'])}")
+    print()
+
+    web_offers = web_search_jobs(
+        profile=profile,
+        keywords=keywords,
+        location=location,
+        platforms=platforms,
+        max_results_per_platform=args.limit,
+        fetch_pages=not args.fast,
+    )
+
+    if not web_offers:
+        print("\n  Aucune offre pertinente trouvée. Essayez d'autres mots-clés.")
+        return
+
+    # Convertir en JobOffer pour réutiliser l'affichage
+    job_offers = offers_to_job_offers(web_offers)
+
+    # Construire les résultats avec les scores IA
+    results = []
+    for offer, web_data in zip(job_offers, web_offers):
+        match_data = compute_match(profile, offer)
+        # Remplacer le score algo par le score IA de Haiku
+        match_data["score"] = float(web_data.get("score", match_data["score"]))
+        match_data["raison_ia"] = web_data.get("raison", "")
+        if web_data.get("date_estimee"):
+            match_data["raison_ia"] += f" [Date: {web_data['date_estimee']}]"
+        results.append({"offer": offer, "match": match_data})
+
+    # Trier par score
+    results.sort(key=lambda r: r["match"]["score"], reverse=True)
+    display_results(results)
+
+    # Mode interactif
+    if results and not args.no_interactive:
+        while True:
+            choice = input(
+                "  Entrez le n° d'une offre pour voir le détail (ou 'q' pour quitter) : "
+            ).strip()
+            if choice.lower() in ("q", "quit", "exit", ""):
+                break
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(results):
+                    r = results[idx]
+                    display_offer_detail(r["offer"], r["match"])
+
+                    see_tips = input(
+                        "\n  Voir les conseils d'entretien ? (o/n) : "
+                    ).strip().lower()
+                    if see_tips in ("o", "oui", "y", "yes"):
+                        tips = generate_tips(profile, r["offer"], r["match"])
+                        print(tips)
+                else:
+                    print(f"  Numéro invalide (1-{len(results)})")
+            except ValueError:
+                print("  Entrez un numéro valide.")
+
+
 def cmd_init_profile(args):
     """Commande de création interactive du profil."""
     create_profile_interactive(args.output)
@@ -314,6 +391,22 @@ def main():
     p_tips.add_argument("job_id", help="ID de l'offre France Travail")
     p_tips.add_argument("-p", "--profile", default=PROFILE_PATH, help="Chemin du profil")
 
+    # web-search
+    p_web = subparsers.add_parser(
+        "web-search",
+        help="Rechercher sur le web (Indeed, WTTJ, APEC, LinkedIn) avec filtrage IA",
+    )
+    p_web.add_argument("-k", "--keywords", help="Mots-clés de recherche")
+    p_web.add_argument("-l", "--location", help="Ville ou département")
+    p_web.add_argument("-n", "--limit", type=int, default=8,
+                       help="Résultats par plateforme (défaut: 8)")
+    p_web.add_argument("-p", "--profile", default=PROFILE_PATH, help="Chemin du profil")
+    p_web.add_argument("--platforms", help="Plateformes (ex: indeed,wttj,apec)")
+    p_web.add_argument("--fast", action="store_true",
+                       help="Mode rapide (pas de récupération du contenu des pages)")
+    p_web.add_argument("--no-interactive", action="store_true",
+                       help="Désactiver le mode interactif")
+
     args = parser.parse_args()
 
     if args.command == "init-profile":
@@ -322,6 +415,8 @@ def main():
         cmd_profile(args)
     elif args.command == "search":
         cmd_search(args)
+    elif args.command == "web-search":
+        cmd_web_search(args)
     elif args.command == "tips":
         cmd_tips(args)
     else:

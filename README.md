@@ -8,6 +8,7 @@ Agent IA de matching d'offres d'emploi qui analyse votre profil, recherche les o
 - **Détection de synonymes** : reconnaît que "GA4" = "Google Analytics 4", "IA" = "Intelligence Artificielle", etc.
 - **Conseils d'entretien** : analyse les écarts entre votre profil et l'offre, propose des axes de préparation
 - **Questions probables** : génère des questions d'entretien adaptées au type de poste
+- **Recherche web multi-plateformes** : cherche sur Indeed, Welcome to the Jungle, APEC, LinkedIn et Hellowork avec filtrage IA par Claude Haiku (vérification des dates, pertinence)
 
 ## Installation
 
@@ -54,6 +55,18 @@ python -m job_agent search -k "UX analyst" -n 10
 
 # Conseils d'entretien pour une offre spécifique
 python -m job_agent tips <ID_OFFRE>
+
+# Recherche web (Indeed, WTTJ, APEC, LinkedIn, Hellowork)
+python -m job_agent web-search
+
+# Recherche web avec mots-clés spécifiques
+python -m job_agent web-search -k "data analyst" -l "Paris"
+
+# Chercher uniquement sur certaines plateformes
+python -m job_agent web-search --platforms "indeed,wttj,apec"
+
+# Mode rapide (sans récupération du contenu des pages)
+python -m job_agent web-search --fast
 ```
 
 ## Algorithme de scoring
@@ -78,6 +91,7 @@ python -m job_agent tips <ID_OFFRE>
 │   ├── profile.py             # Gestion du profil
 │   ├── matching.py            # Algorithme de matching
 │   ├── interview.py           # Générateur de conseils
+│   ├── web_search.py          # Recherche web + filtrage IA
 │   └── api/
 │       ├── base.py            # Modèle JobOffer
 │       └── france_travail.py  # Client API France Travail
