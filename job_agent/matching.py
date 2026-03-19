@@ -76,10 +76,14 @@ def score_titre(profile: dict, offer: JobOffer) -> float:
 
     Compare le titre de l'offre avec les mots-clés du profil pour
     filtrer les postes hors-sujet (ex: Directeur, Poseur signalétique).
+    Utilise des correspondances au niveau des mots entiers pour éviter
+    les faux positifs par sous-chaînes.
     """
     titre_norm = normalize_text(offer.titre)
     if not titre_norm:
-        return 0.3
+        return 0.2
+
+    titre_words = set(titre_norm.split())
 
     # Construire la liste de mots-clés pertinents depuis le profil
     mots_cles_raw = profile.get("mots_cles", "")
@@ -87,29 +91,31 @@ def score_titre(profile: dict, offer: JobOffer) -> float:
     if mots_cles_raw:
         for mot in mots_cles_raw.lower().split():
             mot = mot.strip()
-            if len(mot) >= 2:
+            if len(mot) >= 3:  # Ignorer les mots trop courts (ux, bi)
                 keywords.add(normalize_text(mot))
 
-    # Ajouter les compétences clés du profil (celles >= 3 caractères)
+    # Ajouter les compétences clés du profil (celles >= 4 caractères)
+    # pour éviter les faux positifs avec des abréviations courtes
     for skill in profile.get("competences", []):
         norm = normalize_text(skill)
-        if len(norm) >= 3:
+        if len(norm) >= 4:
             keywords.add(norm)
 
     if not keywords:
-        return 0.5
+        return 0.3
 
     # Compter combien de mots-clés apparaissent dans le titre
+    # en utilisant des correspondances au niveau des mots entiers
     matches = 0
     for kw in keywords:
-        # Vérifier présence dans le titre
-        if kw in titre_norm:
+        # Vérifier si le mot-clé correspond à un ou plusieurs mots du titre
+        if _is_word_boundary_match(kw, titre_norm):
             matches += 1
         else:
             # Vérifier aussi via synonymes
             kw_variants = expand_synonyms(kw)
             for variant in kw_variants:
-                if variant in titre_norm:
+                if _is_word_boundary_match(variant, titre_norm):
                     matches += 1
                     break
 
@@ -117,13 +123,21 @@ def score_titre(profile: dict, offer: JobOffer) -> float:
         # Aucun mot-clé dans le titre → probablement hors-sujet
         return 0.1
 
-    # Score progressif : 1 match = 0.5, 2+ = 0.75+, 3+ = 0.9+
-    if matches >= 3:
+    # Score progressif plus exigeant
+    if matches >= 4:
         return 1.0
-    elif matches == 2:
+    elif matches >= 3:
         return 0.85
+    elif matches == 2:
+        return 0.7
     else:
-        return 0.55
+        return 0.45  # 1 seul match = faible confiance
+
+
+def _is_word_boundary_match(needle: str, haystack: str) -> bool:
+    """Vérifie qu'une sous-chaîne correspond à des mots entiers dans le texte."""
+    pattern = r"(?:^|\s)" + re.escape(needle) + r"(?:\s|$)"
+    return bool(re.search(pattern, haystack))
 
 
 def skill_matches(profile_skill: str, offer_skill: str) -> bool:
@@ -131,23 +145,31 @@ def skill_matches(profile_skill: str, offer_skill: str) -> bool:
     ps = normalize_text(profile_skill)
     os_norm = normalize_text(offer_skill)
 
+    if not ps or not os_norm:
+        return False
+
     # Correspondance exacte
     if ps == os_norm:
         return True
 
-    # Inclusion (substring)
-    if ps in os_norm or os_norm in ps:
-        return True
-
-    # Vérifier les synonymes
+    # Vérifier les synonymes (avant substring pour être plus précis)
     ps_variants = expand_synonyms(profile_skill)
     os_variants = expand_synonyms(offer_skill)
     if ps_variants & os_variants:
         return True
 
-    # Similarité avec difflib (seuil 0.8)
+    # Inclusion (substring) — seulement si le mot court fait >= 4 caractères
+    # et correspond à des mots entiers (pas juste une sous-chaîne de caractères)
+    shorter = ps if len(ps) <= len(os_norm) else os_norm
+    longer = os_norm if len(ps) <= len(os_norm) else ps
+    if len(shorter) >= 4 and _is_word_boundary_match(shorter, longer):
+        return True
+
+    # Similarité avec difflib — seuil plus strict pour les mots courts
+    min_len = min(len(ps), len(os_norm))
+    threshold = 0.85 if min_len >= 8 else 0.92
     ratio = difflib.SequenceMatcher(None, ps, os_norm).ratio()
-    if ratio >= 0.8:
+    if ratio >= threshold:
         return True
 
     return False
@@ -156,7 +178,7 @@ def skill_matches(profile_skill: str, offer_skill: str) -> bool:
 def score_competences(profile: dict, offer: JobOffer) -> tuple[float, list[str], list[str]]:
     """Score de matching des compétences. Retourne (score, matched, gaps)."""
     if not offer.competences_requises:
-        return 0.5, [], []  # Pas d'info → score neutre (pas parfait)
+        return 0.3, [], []  # Pas d'info → score faible (on ne peut pas valider)
 
     profile_skills = profile.get("competences", [])
     matched = []
@@ -187,7 +209,7 @@ def score_localisation(profile: dict, offer: JobOffer) -> float:
     offer_loc = normalize_text(offer.localisation)
 
     if not desired or not offer_loc:
-        return 0.5  # Neutre si pas d'info
+        return 0.3  # Pas d'info → score faible
 
     if desired in offer_loc or offer_loc in desired:
         return 1.0
@@ -213,8 +235,12 @@ def score_experience(profile: dict, offer: JobOffer) -> tuple[float, str]:
     profile_years = profile.get("experience_annees", 0)
     required = parse_experience_years(offer.experience_requise)
 
+    # Si le champ structuré ne donne rien, chercher dans la description
+    if required is None and offer.description:
+        required = parse_experience_years(offer.description)
+
     if required is None:
-        return 0.5, ""  # Pas d'info
+        return 0.3, ""  # Pas d'info → score faible
 
     if profile_years >= required:
         return 1.0, ""
@@ -230,7 +256,7 @@ def score_formation(profile: dict, offer: JobOffer) -> tuple[float, str]:
     profile_level = profile.get("formation_niveau", 0)
 
     if not offer.formation_requise:
-        return 0.5, ""
+        return 0.3, ""  # Pas d'info → score faible
 
     # Chercher le niveau dans le texte de l'offre
     offer_text = offer.formation_requise.lower()
@@ -240,7 +266,7 @@ def score_formation(profile: dict, offer: JobOffer) -> tuple[float, str]:
             offer_level = max(offer_level, level)
 
     if offer_level == 0:
-        return 0.5, ""
+        return 0.3, ""
 
     if profile_level >= offer_level:
         return 1.0, ""
@@ -257,10 +283,10 @@ def score_salaire(profile: dict, offer: JobOffer) -> float:
     o_max = offer.salaire_max
 
     if not o_min and not o_max:
-        return 0.5  # Pas d'info salaire
+        return 0.3  # Pas d'info salaire → score faible
 
     if not p_min and not p_max:
-        return 0.5
+        return 0.3
 
     # Vérifier le chevauchement des fourchettes
     p_min = p_min or 0
@@ -282,7 +308,7 @@ def score_contrat(profile: dict, offer: JobOffer) -> float:
     """Score de correspondance du type de contrat."""
     desired = [c.upper() for c in profile.get("types_contrat", [])]
     if not desired or not offer.type_contrat:
-        return 0.5
+        return 0.3
 
     if offer.type_contrat.upper() in desired:
         return 1.0
