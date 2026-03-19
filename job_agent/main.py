@@ -17,9 +17,11 @@ def display_results(results: list[dict]):
         print("\n  Aucune offre trouvée. Essayez d'élargir vos critères.\n")
         return
 
-    print(f"\n{'=' * 90}")
+    has_ia = any(r["match"].get("raison_ia") for r in results)
+
+    print(f"\n{'=' * 100}")
     print(f"  {'#':<4} {'SCORE':<8} {'POSTE':<30} {'ENTREPRISE':<20} {'CONTRAT':<8} {'LIEU'}")
-    print(f"{'─' * 90}")
+    print(f"{'─' * 100}")
 
     for i, r in enumerate(results, 1):
         offer = r["offer"]
@@ -42,9 +44,14 @@ def display_results(results: list[dict]):
             f"  {i:<4} {score:>5.1f}% {indicator} {titre:<30} {entreprise:<20} "
             f"{offer.type_contrat:<8} {lieu}"
         )
+        # Afficher la raison IA sur la ligne suivante
+        raison = match.get("raison_ia", "")
+        if raison:
+            print(f"       {'':>8} -> {raison}")
 
-    print(f"{'=' * 90}")
-    print(f"  {len(results)} offre(s) trouvée(s)\n")
+    print(f"{'=' * 100}")
+    mode = "IA (Claude)" if has_ia else "algorithmique"
+    print(f"  {len(results)} offre(s) trouvée(s) — scoring {mode}\n")
 
 
 def display_offer_detail(offer: JobOffer, match: dict):
@@ -77,11 +84,31 @@ def display_offer_detail(offer: JobOffer, match: dict):
         bar = "█" * int(score / 5) + "░" * (20 - int(score / 5))
         print(f"  {comp:<15} {bar} {score}%")
 
+    if match.get("raison_ia"):
+        print(f"\n  Avis IA : {match['raison_ia']}")
+
     if match["matched_skills"]:
         print(f"\n  ✓ Compétences matchées : {', '.join(match['matched_skills'])}")
     if match["skill_gaps"]:
         print(f"  ✗ Compétences manquantes : {', '.join(match['skill_gaps'])}")
     print(f"{'=' * 60}")
+
+
+def _try_llm_scoring(profile: dict, offers: list) -> dict | None:
+    """Tente le scoring IA. Retourne None si indisponible."""
+    import os
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    try:
+        from job_agent.llm_scoring import score_offers_with_llm
+        print("\n  Analyse IA des offres en cours (Claude lit chaque offre)...")
+        return score_offers_with_llm(profile, offers)
+    except ImportError:
+        print("  pip install anthropic pour activer le scoring IA")
+        return None
+    except Exception as e:
+        print(f"  Erreur scoring IA : {e}")
+        return None
 
 
 def cmd_search(args):
@@ -155,11 +182,23 @@ def cmd_search(args):
 
     print(f"\n  Total : {len(offers)} offre(s) unique(s) trouvée(s)")
 
-    # Calculer le matching
+    # Calculer le matching algorithmique
     results = []
     for offer in offers:
         match = compute_match(profile, offer)
         results.append({"offer": offer, "match": match})
+
+    # Scoring IA : Claude lit chaque offre et évalue la pertinence réelle
+    llm_scores = _try_llm_scoring(profile, offers)
+    if llm_scores:
+        for r in results:
+            offer_id = r["offer"].id
+            if offer_id in llm_scores:
+                llm = llm_scores[offer_id]
+                r["match"]["score"] = float(llm["score"])
+                r["match"]["raison_ia"] = llm["raison"]
+    else:
+        print("  (Scoring algorithmique uniquement — ajoutez ANTHROPIC_API_KEY pour le scoring IA)")
 
     # Trier par score décroissant
     results.sort(key=lambda r: r["match"]["score"], reverse=True)
