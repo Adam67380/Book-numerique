@@ -274,7 +274,7 @@ def cmd_web_search(args):
         platforms = [p.strip() for p in args.platforms.split(",")]
 
     print(f"\n  Recherche web : \"{keywords}\" à {location or 'toute la France'}")
-    print(f"  Plateformes : {', '.join(platforms or ['indeed', 'wttj', 'apec', 'linkedin', 'hellowork'])}")
+    print(f"  Plateformes : {', '.join(platforms or ['indeed', 'wttj', 'hellowork', 'apec'])}")
     print()
 
     web_offers = web_search_jobs(

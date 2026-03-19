@@ -1,6 +1,6 @@
 """Recherche d'offres d'emploi sur le web + filtrage IA par Claude Haiku.
 
-Cherche sur Indeed, Welcome to the Jungle, APEC, LinkedIn et autres,
+Requête directement les sites d'emploi (Indeed, WTTJ, Hellowork, APEC),
 puis fait passer chaque offre en revue par Haiku pour vérifier :
 - Que l'offre est encore en ligne / récente
 - Que le poste correspond réellement au profil
@@ -21,163 +21,291 @@ from job_agent.api.base import JobOffer
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Recherche web multi-moteurs
+# Session HTTP partagée (réutilise les connexions + proxy système)
 # ──────────────────────────────────────────────────────────────────────
 
-# Plateformes cibles pour la recherche d'offres
-JOB_PLATFORMS = {
-    "indeed": "site:indeed.fr",
-    "wttj": "site:welcometothejungle.com",
-    "apec": "site:apec.fr",
-    "linkedin": "site:linkedin.com/jobs",
-    "hellowork": "site:hellowork.com",
-}
-
-# User-Agent réaliste pour éviter les blocages
-_HEADERS = {
+_session = requests.Session()
+_session.trust_env = True  # Utilise le proxy système (Windows)
+_session.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+})
 
 
-def _web_search(query: str, max_results: int = 10) -> list[dict]:
-    """Recherche web via plusieurs moteurs (Google HTML > DuckDuckGo HTML > ddgs lib).
+# ──────────────────────────────────────────────────────────────────────
+# Scrapers par plateforme (requêtes directes, pas de moteur de recherche)
+# ──────────────────────────────────────────────────────────────────────
 
-    Retourne une liste de dicts: {"title", "url", "snippet"}.
-    """
-    # Essayer Google d'abord (fonctionne sur la plupart des réseaux d'entreprise)
-    results = _google_html_search(query, max_results)
-    if results:
-        return results
-
-    # Fallback : DuckDuckGo HTML
-    results = _duckduckgo_html_search(query, max_results)
-    if results:
-        return results
-
-    # Dernier recours : librairie ddgs
-    results = _ddgs_lib_search(query, max_results)
-    return results
-
-
-def _google_html_search(query: str, max_results: int = 10) -> list[dict]:
-    """Recherche via Google HTML (pas de JS nécessaire)."""
+def _search_indeed(keywords: str, location: str, limit: int = 10) -> list[dict]:
+    """Recherche directe sur Indeed.fr."""
     results = []
     try:
-        resp = requests.get(
-            "https://www.google.com/search",
-            params={"q": query, "num": max_results, "hl": "fr", "gl": "fr"},
-            headers=_HEADERS,
+        resp = _session.get(
+            "https://fr.indeed.com/jobs",
+            params={"q": keywords, "l": location, "sort": "date", "limit": limit},
             timeout=15,
         )
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Parser les résultats Google
-        for g in soup.select("div.g, div[data-sokoban-container]"):
-            link = g.select_one("a[href^='http']")
-            if not link:
+        # Indeed utilise des divs avec data-jk pour les offres
+        for card in soup.select("div.job_seen_beacon, div.jobsearch-ResultsList > div"):
+            title_el = card.select_one("h2.jobTitle a, a.jcs-JobTitle")
+            company_el = card.select_one("span[data-testid='company-name'], span.companyName")
+            location_el = card.select_one("div[data-testid='text-location'], div.companyLocation")
+            snippet_el = card.select_one("div.job-snippet, td.snip")
+            date_el = card.select_one("span.date, span[data-testid='myJobsStateDate']")
+
+            if not title_el:
                 continue
-            url = link.get("href", "")
-            # Ignorer les liens Google internes
-            if "google.com" in url:
-                continue
 
-            title_el = g.select_one("h3")
-            snippet_el = (
-                g.select_one("div[data-sncf]")
-                or g.select_one("div.VwiC3b")
-                or g.select_one("span.aCOpRe")
-                or g.select_one("div[style='-webkit-line-clamp:2']")
-            )
-            # Fallback : prendre le texte du bloc entier si pas de snippet
-            if not snippet_el:
-                snippet_el = g
+            href = title_el.get("href", "")
+            if href and not href.startswith("http"):
+                href = "https://fr.indeed.com" + href
 
-            title = title_el.get_text(strip=True) if title_el else ""
-            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-
-            if title and url:
-                results.append({"title": title, "url": url, "snippet": snippet[:500]})
-
-            if len(results) >= max_results:
+            results.append({
+                "title": title_el.get_text(strip=True),
+                "url": href,
+                "snippet": (
+                    (company_el.get_text(strip=True) + " — " if company_el else "")
+                    + (location_el.get_text(strip=True) + " — " if location_el else "")
+                    + (snippet_el.get_text(strip=True) if snippet_el else "")
+                    + (" — " + date_el.get_text(strip=True) if date_el else "")
+                ),
+                "platform": "indeed",
+            })
+            if len(results) >= limit:
                 break
 
     except Exception as e:
-        print(f"    Google : {e}")
+        print(f"    Indeed : {e}")
 
     return results
 
 
-def _duckduckgo_html_search(query: str, max_results: int = 10) -> list[dict]:
-    """Recherche via DuckDuckGo HTML (fallback)."""
+def _search_wttj(keywords: str, location: str, limit: int = 10) -> list[dict]:
+    """Recherche via l'API WTTJ (Welcome to the Jungle)."""
     results = []
     try:
-        resp = requests.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query, "kl": "fr-fr"},
-            headers=_HEADERS,
+        # WTTJ a une API publique de recherche
+        resp = _session.get(
+            "https://api.welcometothejungle.com/api/v1/jobs",
+            params={
+                "query": keywords,
+                "page": 1,
+                "per_page": limit,
+                "aroundLatLng": "",
+                "contract_type[]": "full-time",
+            },
+            headers={
+                "Accept": "application/json",
+                "x-wttj-gateway": "default",
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for job in data.get("jobs", data.get("results", [])):
+                name = job.get("name", "")
+                org = job.get("organization", {})
+                company = org.get("name", "Inconnue")
+                office = job.get("office", {})
+                city = office.get("city", location)
+                contract = job.get("contract_type", {})
+
+                results.append({
+                    "title": name,
+                    "url": f"https://www.welcometothejungle.com/fr/companies/{org.get('slug', '')}/jobs/{job.get('slug', '')}",
+                    "snippet": (
+                        f"{company} — {city} — "
+                        f"{contract.get('fr', '') if isinstance(contract, dict) else contract} — "
+                        f"{job.get('description', '')[:200]}"
+                    ),
+                    "platform": "wttj",
+                })
+                if len(results) >= limit:
+                    break
+        else:
+            # Fallback : scraper la page HTML de WTTJ
+            results = _search_wttj_html(keywords, location, limit)
+
+    except Exception as e:
+        print(f"    WTTJ API : {e}")
+        results = _search_wttj_html(keywords, location, limit)
+
+    return results
+
+
+def _search_wttj_html(keywords: str, location: str, limit: int = 10) -> list[dict]:
+    """Fallback WTTJ : scrape la page HTML de recherche."""
+    results = []
+    try:
+        resp = _session.get(
+            "https://www.welcometothejungle.com/fr/jobs",
+            params={"query": keywords, "refinementList[offices.city][]": location},
             timeout=15,
         )
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        for result in soup.select(".result")[:max_results]:
-            title_el = result.select_one(".result__title a")
-            snippet_el = result.select_one(".result__snippet")
-            if title_el:
-                url = title_el.get("href", "")
-                if "uddg=" in url:
-                    url = urllib.parse.unquote(
-                        url.split("uddg=")[1].split("&")[0]
-                    )
-                results.append({
-                    "title": title_el.get_text(strip=True),
-                    "url": url,
-                    "snippet": (
-                        snippet_el.get_text(strip=True) if snippet_el else ""
-                    ),
-                })
+        for card in soup.select("li[data-testid='search-results-list-item-wrapper'], div[role='listitem']"):
+            link = card.select_one("a[href*='/jobs/']")
+            if not link:
+                continue
+            href = link.get("href", "")
+            if not href.startswith("http"):
+                href = "https://www.welcometothejungle.com" + href
+            text = card.get_text(separator=" — ", strip=True)
+            results.append({
+                "title": link.get_text(strip=True)[:100],
+                "url": href,
+                "snippet": text[:300],
+                "platform": "wttj",
+            })
+            if len(results) >= limit:
+                break
+
     except Exception as e:
-        print(f"    DuckDuckGo : {e}")
+        print(f"    WTTJ HTML : {e}")
 
     return results
 
 
-def _ddgs_lib_search(query: str, max_results: int = 10) -> list[dict]:
-    """Recherche via la librairie ddgs/duckduckgo_search (dernier recours)."""
+def _search_hellowork(keywords: str, location: str, limit: int = 10) -> list[dict]:
+    """Recherche directe sur Hellowork."""
     results = []
-    # Essayer le nouveau nom de package d'abord, puis l'ancien
-    DDGS = None
     try:
-        from ddgs import DDGS as _DDGS
-        DDGS = _DDGS
-    except ImportError:
-        try:
-            from duckduckgo_search import DDGS as _DDGS
-            DDGS = _DDGS
-        except ImportError:
-            pass
+        kw_slug = keywords.replace(" ", "-").lower()
+        resp = _session.get(
+            f"https://www.hellowork.com/fr-fr/emploi/recherche.html",
+            params={"k": keywords, "l": location, "ray": 50},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-    if DDGS is None:
-        return results
+        for card in soup.select("li[data-cy='offerItem'], div.offer-card, article"):
+            link = card.select_one("a[href*='/emploi/']")
+            title_el = card.select_one("h3, h2, [data-cy='offerTitle']")
+            if not (link or title_el):
+                continue
+            href = ""
+            if link:
+                href = link.get("href", "")
+                if not href.startswith("http"):
+                    href = "https://www.hellowork.com" + href
 
-    try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, region="fr-fr", max_results=max_results):
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "snippet": r.get("body", ""),
-                })
+            results.append({
+                "title": (title_el or link).get_text(strip=True)[:100],
+                "url": href,
+                "snippet": card.get_text(separator=" — ", strip=True)[:300],
+                "platform": "hellowork",
+            })
+            if len(results) >= limit:
+                break
+
     except Exception as e:
-        print(f"    ddgs lib : {e}")
+        print(f"    Hellowork : {e}")
 
     return results
+
+
+def _search_apec(keywords: str, location: str, limit: int = 10) -> list[dict]:
+    """Recherche via l'API APEC."""
+    results = []
+    try:
+        # L'APEC a une API JSON interne
+        resp = _session.post(
+            "https://api.apec.fr/portail-offre/rest/v1/offres",
+            json={
+                "motsCles": keywords,
+                "lieux": [{"lieu": location}] if location else [],
+                "pagination": {"range": f"0-{limit - 1}"},
+                "tri": "DATE",
+            },
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for offre in data.get("resultats", []):
+                results.append({
+                    "title": offre.get("intitule", ""),
+                    "url": f"https://www.apec.fr/candidat/recherche-emploi.html/emploi/detail-offre/{offre.get('numeroOffre', '')}",
+                    "snippet": (
+                        f"{offre.get('nomCompagnie', '')} — "
+                        f"{offre.get('lieux', '')} — "
+                        f"{offre.get('typeContrat', '')} — "
+                        f"Publié le {offre.get('datePublication', 'inconnu')} — "
+                        f"{offre.get('texteHtml', offre.get('description', ''))[:200]}"
+                    ),
+                    "platform": "apec",
+                })
+                if len(results) >= limit:
+                    break
+        else:
+            # Fallback HTML
+            results = _search_apec_html(keywords, limit)
+
+    except Exception as e:
+        print(f"    APEC API : {e}")
+        results = _search_apec_html(keywords, limit)
+
+    return results
+
+
+def _search_apec_html(keywords: str, limit: int = 10) -> list[dict]:
+    """Fallback APEC : scrape la page de résultats."""
+    results = []
+    try:
+        resp = _session.get(
+            "https://www.apec.fr/candidat/recherche-emploi.html/emploi",
+            params={"motsCles": keywords},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        for card in soup.select("div.card-offer, li.search-result"):
+            link = card.select_one("a[href*='detail-offre']")
+            title_el = card.select_one("h2, h3, .card-title")
+            if not (link or title_el):
+                continue
+            href = ""
+            if link:
+                href = link.get("href", "")
+                if not href.startswith("http"):
+                    href = "https://www.apec.fr" + href
+
+            results.append({
+                "title": (title_el or link).get_text(strip=True)[:100],
+                "url": href,
+                "snippet": card.get_text(separator=" — ", strip=True)[:300],
+                "platform": "apec",
+            })
+            if len(results) >= limit:
+                break
+
+    except Exception as e:
+        print(f"    APEC HTML : {e}")
+
+    return results
+
+
+# Map des plateformes vers leurs fonctions de recherche
+PLATFORM_SEARCHERS = {
+    "indeed": _search_indeed,
+    "wttj": _search_wttj,
+    "hellowork": _search_hellowork,
+    "apec": _search_apec,
+}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -381,12 +509,12 @@ def web_search_jobs(
         return []
 
     if platforms is None:
-        platforms = list(JOB_PLATFORMS.keys())
+        platforms = list(PLATFORM_SEARCHERS.keys())
 
-    # Construire les requêtes de recherche par plateforme
+    # Requêter chaque plateforme directement
     all_results = []
     search_terms = [kw]
-    # Ajouter des variantes courtes
+    # Ajouter des variantes courtes pour élargir
     terms = [t.strip() for t in kw.split() if len(t.strip()) > 2]
     for i in range(0, len(terms), 2):
         group = " ".join(terms[i:i + 2])
@@ -396,19 +524,27 @@ def web_search_jobs(
     search_terms = search_terms[:3]  # Max 3 variantes
 
     for platform in platforms:
-        site_filter = JOB_PLATFORMS.get(platform, "")
+        searcher = PLATFORM_SEARCHERS.get(platform)
+        if not searcher:
+            print(f"  Plateforme inconnue : {platform}")
+            continue
+
         for term in search_terms:
-            query = f"{term} {loc} emploi CDI 2026 {site_filter}".strip()
-            print(f"  Recherche sur {platform}: \"{term}\"...")
+            print(f"  {platform}: \"{term}\"...")
 
-            results = _web_search(query, max_results=max_results_per_platform)
+            try:
+                results = searcher(term, loc, limit=max_results_per_platform)
+                for r in results:
+                    r["search_term"] = term
+                all_results.extend(results)
+                if results:
+                    print(f"    → {len(results)} résultat(s)")
+                else:
+                    print(f"    → aucun résultat")
+            except Exception as e:
+                print(f"    → erreur : {e}")
 
-            for r in results:
-                r["platform"] = platform
-                r["search_term"] = term
-
-            all_results.extend(results)
-            time.sleep(0.5)  # Politesse entre requêtes
+            time.sleep(0.3)  # Politesse entre requêtes
 
     # Dédupliquer par URL
     seen_urls = set()
