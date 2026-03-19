@@ -268,22 +268,13 @@ def cmd_web_search(args):
         print("Erreur : spécifiez des mots-clés avec --keywords ou dans votre profil.")
         sys.exit(1)
 
-    # Plateformes à chercher
-    platforms = None
-    if args.platforms:
-        platforms = [p.strip() for p in args.platforms.split(",")]
-
     print(f"\n  Recherche web : \"{keywords}\" à {location or 'toute la France'}")
-    print(f"  Plateformes : {', '.join(platforms or ['indeed', 'wttj', 'hellowork', 'apec'])}")
     print()
 
     web_offers = web_search_jobs(
         profile=profile,
         keywords=keywords,
         location=location,
-        platforms=platforms,
-        max_results_per_platform=args.limit,
-        fetch_pages=not args.fast,
     )
 
     if not web_offers:
@@ -394,16 +385,11 @@ def main():
     # web-search
     p_web = subparsers.add_parser(
         "web-search",
-        help="Rechercher sur le web (Indeed, WTTJ, APEC, LinkedIn) avec filtrage IA",
+        help="Rechercher sur le web (Indeed, WTTJ, APEC, LinkedIn) via Claude IA",
     )
     p_web.add_argument("-k", "--keywords", help="Mots-clés de recherche")
     p_web.add_argument("-l", "--location", help="Ville ou département")
-    p_web.add_argument("-n", "--limit", type=int, default=8,
-                       help="Résultats par plateforme (défaut: 8)")
     p_web.add_argument("-p", "--profile", default=PROFILE_PATH, help="Chemin du profil")
-    p_web.add_argument("--platforms", help="Plateformes (ex: indeed,wttj,apec)")
-    p_web.add_argument("--fast", action="store_true",
-                       help="Mode rapide (pas de récupération du contenu des pages)")
     p_web.add_argument("--no-interactive", action="store_true",
                        help="Désactiver le mode interactif")
 
