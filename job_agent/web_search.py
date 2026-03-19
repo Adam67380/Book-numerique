@@ -11,6 +11,7 @@ import json
 import os
 import re
 import time
+import urllib.parse
 from datetime import datetime
 
 import requests
@@ -20,7 +21,7 @@ from job_agent.api.base import JobOffer
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Recherche web via DuckDuckGo
+# Recherche web multi-moteurs
 # ──────────────────────────────────────────────────────────────────────
 
 # Plateformes cibles pour la recherche d'offres
@@ -39,36 +40,81 @@ _HEADERS = {
         "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 
-def _duckduckgo_search(query: str, max_results: int = 10) -> list[dict]:
-    """Recherche DuckDuckGo HTML et retourne les résultats.
+def _web_search(query: str, max_results: int = 10) -> list[dict]:
+    """Recherche web via plusieurs moteurs (Google HTML > DuckDuckGo HTML > ddgs lib).
 
     Retourne une liste de dicts: {"title", "url", "snippet"}.
     """
+    # Essayer Google d'abord (fonctionne sur la plupart des réseaux d'entreprise)
+    results = _google_html_search(query, max_results)
+    if results:
+        return results
+
+    # Fallback : DuckDuckGo HTML
+    results = _duckduckgo_html_search(query, max_results)
+    if results:
+        return results
+
+    # Dernier recours : librairie ddgs
+    results = _ddgs_lib_search(query, max_results)
+    return results
+
+
+def _google_html_search(query: str, max_results: int = 10) -> list[dict]:
+    """Recherche via Google HTML (pas de JS nécessaire)."""
     results = []
     try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, region="fr-fr", max_results=max_results):
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "snippet": r.get("body", ""),
-                })
-    except ImportError:
-        # Fallback : recherche DuckDuckGo HTML basique
-        results = _duckduckgo_html_fallback(query, max_results)
+        resp = requests.get(
+            "https://www.google.com/search",
+            params={"q": query, "num": max_results, "hl": "fr", "gl": "fr"},
+            headers=_HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Parser les résultats Google
+        for g in soup.select("div.g, div[data-sokoban-container]"):
+            link = g.select_one("a[href^='http']")
+            if not link:
+                continue
+            url = link.get("href", "")
+            # Ignorer les liens Google internes
+            if "google.com" in url:
+                continue
+
+            title_el = g.select_one("h3")
+            snippet_el = (
+                g.select_one("div[data-sncf]")
+                or g.select_one("div.VwiC3b")
+                or g.select_one("span.aCOpRe")
+                or g.select_one("div[style='-webkit-line-clamp:2']")
+            )
+            # Fallback : prendre le texte du bloc entier si pas de snippet
+            if not snippet_el:
+                snippet_el = g
+
+            title = title_el.get_text(strip=True) if title_el else ""
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+
+            if title and url:
+                results.append({"title": title, "url": url, "snippet": snippet[:500]})
+
+            if len(results) >= max_results:
+                break
+
     except Exception as e:
-        print(f"    Erreur DuckDuckGo : {e}")
-        results = _duckduckgo_html_fallback(query, max_results)
+        print(f"    Google : {e}")
 
     return results
 
 
-def _duckduckgo_html_fallback(query: str, max_results: int = 10) -> list[dict]:
-    """Fallback : parse la page HTML de DuckDuckGo."""
+def _duckduckgo_html_search(query: str, max_results: int = 10) -> list[dict]:
+    """Recherche via DuckDuckGo HTML (fallback)."""
     results = []
     try:
         resp = requests.get(
@@ -85,16 +131,51 @@ def _duckduckgo_html_fallback(query: str, max_results: int = 10) -> list[dict]:
             snippet_el = result.select_one(".result__snippet")
             if title_el:
                 url = title_el.get("href", "")
-                # DuckDuckGo encode les URLs dans un redirect
                 if "uddg=" in url:
-                    url = requests.utils.unquote(url.split("uddg=")[1].split("&")[0])
+                    url = urllib.parse.unquote(
+                        url.split("uddg=")[1].split("&")[0]
+                    )
                 results.append({
                     "title": title_el.get_text(strip=True),
                     "url": url,
-                    "snippet": snippet_el.get_text(strip=True) if snippet_el else "",
+                    "snippet": (
+                        snippet_el.get_text(strip=True) if snippet_el else ""
+                    ),
                 })
     except Exception as e:
-        print(f"    Erreur recherche HTML : {e}")
+        print(f"    DuckDuckGo : {e}")
+
+    return results
+
+
+def _ddgs_lib_search(query: str, max_results: int = 10) -> list[dict]:
+    """Recherche via la librairie ddgs/duckduckgo_search (dernier recours)."""
+    results = []
+    # Essayer le nouveau nom de package d'abord, puis l'ancien
+    DDGS = None
+    try:
+        from ddgs import DDGS as _DDGS
+        DDGS = _DDGS
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS as _DDGS
+            DDGS = _DDGS
+        except ImportError:
+            pass
+
+    if DDGS is None:
+        return results
+
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, region="fr-fr", max_results=max_results):
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "snippet": r.get("body", ""),
+                })
+    except Exception as e:
+        print(f"    ddgs lib : {e}")
 
     return results
 
@@ -320,7 +401,7 @@ def web_search_jobs(
             query = f"{term} {loc} emploi CDI 2026 {site_filter}".strip()
             print(f"  Recherche sur {platform}: \"{term}\"...")
 
-            results = _duckduckgo_search(query, max_results=max_results_per_platform)
+            results = _web_search(query, max_results=max_results_per_platform)
 
             for r in results:
                 r["platform"] = platform
