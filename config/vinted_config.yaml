@@ -1,0 +1,61 @@
+# Configuration Agent Vinted — Achat/Revente
+# Modifiez les marques, prix et critères selon votre stratégie
+
+country: fr
+scan_interval_seconds: 120    # 2 minutes entre chaque cycle
+max_results_per_search: 20
+
+brands:
+  - name: Ralph Lauren
+    keywords:
+      - Ralph Lauren polo
+      - Ralph Lauren chemise
+      - Ralph Lauren blouson
+    price_from: 5
+    price_to: 40
+    resale_min: 25
+
+  - name: Tommy Hilfiger
+    keywords:
+      - Tommy Hilfiger veste
+      - Tommy Hilfiger pull
+      - Tommy Hilfiger chemise
+    price_from: 5
+    price_to: 35
+    resale_min: 20
+
+  - name: Lacoste
+    keywords:
+      - Lacoste polo
+      - Lacoste sweat
+      - Lacoste veste
+    price_from: 5
+    price_to: 30
+    resale_min: 20
+
+  - name: The North Face
+    keywords:
+      - The North Face doudoune
+      - The North Face veste
+      - The North Face polaire
+    price_from: 10
+    price_to: 60
+    resale_min: 40
+
+  - name: Nike
+    keywords:
+      - Nike vintage sweat
+      - Nike veste
+      - Nike coupe-vent
+    price_from: 5
+    price_to: 30
+    resale_min: 20
+
+filters:
+  exclude_countries: []
+  min_photos: 2
+  max_favourite_count: 50
+
+notifications:
+  enabled: false
+  discord_webhook: ""
