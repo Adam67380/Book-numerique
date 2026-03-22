@@ -146,182 +146,70 @@ CONFIG = {
 
 class VintedAPI:
     """
-    Client pour l'API interne de Vinted.
+    Client API Vinted utilisant Playwright (vrai navigateur).
 
-    Utilise curl_cffi pour imiter l'empreinte TLS d'un vrai navigateur Chrome
-    et contourner la protection Cloudflare.
+    Toutes les requêtes API sont faites DEPUIS le navigateur via fetch(),
+    ce qui contourne Cloudflare puisque le navigateur a déjà passé le challenge.
     """
 
     BASE = "https://www.vinted.fr"
     API = "https://www.vinted.fr/api/v2"
 
-    IMPERSONATE_OPTIONS = ["chrome131", "chrome124", "chrome120", "chrome116", "chrome110", "chrome"]
-
     def __init__(self):
-        if not HAS_CURL_CFFI:
-            raise RuntimeError(
-                "curl_cffi est requis. Installe avec : pip install curl_cffi"
-            )
         if not HAS_PLAYWRIGHT:
             raise RuntimeError(
-                "playwright est requis pour obtenir les cookies Vinted.\n"
-                "Installe avec :\n"
+                "playwright est requis.\n"
                 "  pip install playwright\n"
                 "  playwright install chromium"
             )
-
-        self._impersonate = self._find_working_impersonate()
-        logging.info(f"[API] Impersonation: {self._impersonate}")
-
-        self.session = curl_requests.Session(
-            impersonate=self._impersonate,
-            verify=False,
-        )
-        self._cookie_refreshed = False
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._ready = False
         self._request_count = 0
         self._last_request = 0
-        self._consecutive_failures = 0
 
-    @classmethod
-    def _find_working_impersonate(cls) -> str:
-        for imp in cls.IMPERSONATE_OPTIONS:
-            try:
-                s = curl_requests.Session(impersonate=imp, verify=False)
-                s.close()
-                return imp
-            except Exception:
-                continue
-        return "chrome"
+    def _ensure_browser(self):
+        """Lance le navigateur et passe le challenge Cloudflare une seule fois."""
+        if self._ready and self._page:
+            return
 
-    def _get_headers(self, accept: str = "application/json, text/plain, */*") -> dict:
-        """Headers qui imitent un vrai navigateur."""
-        return {
-            "Accept": accept,
-            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": f"{self.BASE}/catalog",
-            "Origin": self.BASE,
-            "DNT": "1",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        }
+        logging.info("[API] 🌐 Lancement du navigateur...")
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+        self._context = self._browser.new_context(
+            locale="fr-FR",
+            viewport={"width": 1366, "height": 768},
+        )
+        self._page = self._context.new_page()
 
-    def _refresh_cookies(self):
-        """
-        Lance un navigateur Playwright, visite Vinted, passe Cloudflare,
-        puis extrait les cookies ET le token d'accès depuis le contexte JS.
-        """
-        for attempt in range(3):
-            try:
-                logging.info(f"[API] 🌐 Ouverture navigateur (tentative {attempt + 1})...")
+        # Visiter Vinted et attendre que Cloudflare soit passé
+        self._page.goto(self.BASE, wait_until="domcontentloaded", timeout=60000)
+        logging.info("[API] ⏳ Attente résolution Cloudflare...")
 
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(
-                        headless=False,
-                        args=[
-                            "--disable-blink-features=AutomationControlled",
-                            "--no-sandbox",
-                        ],
-                    )
-                    context = browser.new_context(
-                        locale="fr-FR",
-                        viewport={"width": 1366, "height": 768},
-                    )
-                    page = context.new_page()
+        # Attendre qu'un élément du vrai site Vinted apparaisse
+        try:
+            self._page.wait_for_selector(
+                "a[href*='/catalog'], input, [data-testid], nav, .web_ui",
+                timeout=90000,
+            )
+        except Exception:
+            # En dernier recours, attendre 15s
+            logging.warning("[API] ⏱️ Timeout sélecteur, attente fixe 15s...")
+            self._page.wait_for_timeout(15000)
 
-                    page.goto(self.BASE, wait_until="domcontentloaded", timeout=60000)
-                    logging.info("[API] ⏳ Attente résolution Cloudflare...")
-
-                    # Attendre que la vraie page Vinted charge (pas le challenge)
-                    # On cherche un élément du site (barre de recherche, logo, etc.)
-                    try:
-                        page.wait_for_selector(
-                            "a[href*='/catalog'], input[type='search'], [data-testid], .web_ui__Navigation",
-                            timeout=60000,
-                        )
-                        logging.info("[API] ✅ Page Vinted chargée")
-                    except Exception:
-                        logging.warning("[API] ⏱️ Timeout en attendant la page Vinted")
-
-                    # Laisser le JS finir de s'exécuter
-                    page.wait_for_timeout(3000)
-
-                    # Extraire le token d'accès depuis le JS / localStorage / cookies
-                    token = page.evaluate("""() => {
-                        // Méthode 1: localStorage
-                        for (let i = 0; i < localStorage.length; i++) {
-                            const key = localStorage.key(i);
-                            if (key && (key.includes('access_token') || key.includes('auth'))) {
-                                try {
-                                    const val = JSON.parse(localStorage.getItem(key));
-                                    if (val && val.access_token) return val.access_token;
-                                    if (typeof val === 'string' && val.length > 20) return val;
-                                } catch(e) {
-                                    const val = localStorage.getItem(key);
-                                    if (val && val.length > 20) return val;
-                                }
-                            }
-                        }
-
-                        // Méthode 2: meta tags
-                        const meta = document.querySelector('meta[name*="token"], meta[name*="csrf"]');
-                        if (meta) return meta.content;
-
-                        // Méthode 3: chercher dans le HTML un token
-                        const scripts = document.querySelectorAll('script');
-                        for (const s of scripts) {
-                            const text = s.textContent || '';
-                            const match = text.match(/"access_token"\\s*:\\s*"([^"]+)"/);
-                            if (match) return match[1];
-                        }
-
-                        return null;
-                    }""")
-
-                    # Récupérer les cookies
-                    browser_cookies = context.cookies()
-                    browser.close()
-
-                if token:
-                    logging.info(f"[API] 🔑 Token trouvé: {token[:20]}...")
-                else:
-                    logging.info("[API] Pas de token JS, on utilise les cookies seuls")
-
-                # Recréer la session curl_cffi
-                self.session = curl_requests.Session(
-                    impersonate=self._impersonate,
-                    verify=False,
-                )
-
-                # Transférer les cookies
-                cookie_names = []
-                for c in browser_cookies:
-                    self.session.cookies.set(
-                        c["name"], c["value"],
-                        domain=c.get("domain", ".vinted.fr"),
-                        path=c.get("path", "/"),
-                    )
-                    cookie_names.append(c["name"])
-
-                logging.info(f"[API] 🍪 Cookies transférés: {cookie_names}")
-
-                # Si on a un token, l'ajouter aux headers par défaut
-                if token:
-                    self.session.headers.update({
-                        "Authorization": f"Bearer {token}",
-                    })
-
-                self._cookie_refreshed = True
-                self._consecutive_failures = 0
-                return
-
-            except Exception as e:
-                wait = random.uniform(5, 10) * (attempt + 1)
-                logging.error(f"[API] Erreur navigateur (tentative {attempt + 1}): {e}")
-                time.sleep(wait)
-
-        self._cookie_refreshed = True
-        logging.error("[API] ⚠️ Impossible d'obtenir des cookies après 3 tentatives")
+        # Vérifier que la page est bien Vinted
+        self._page.wait_for_timeout(3000)
+        title = self._page.title()
+        logging.info(f"[API] ✅ Navigateur prêt (titre: {title})")
+        self._ready = True
 
     def _rate_limit(self):
         """Délai adaptatif anti-ban."""
@@ -329,19 +217,11 @@ class VintedAPI:
         now = time.time()
         elapsed = now - self._last_request
 
-        if self._consecutive_failures >= 3:
-            base_delay = random.uniform(10, 20)
-            logging.info(f"[API] Délai rallongé après {self._consecutive_failures} échecs ({base_delay:.0f}s)...")
-        else:
-            base_delay = random.uniform(2.0, 4.5)
+        base_delay = random.uniform(2.0, 4.0)
 
         if self._request_count % 15 == 0:
-            base_delay = random.uniform(10, 20)
+            base_delay = random.uniform(8, 15)
             logging.info(f"[API] Pause anti-ban ({base_delay:.0f}s)...")
-
-        if self._request_count % 40 == 0:
-            self._refresh_cookies()
-            base_delay += random.uniform(3, 6)
 
         wait = max(0, base_delay - elapsed)
         if wait > 0:
@@ -353,110 +233,112 @@ class VintedAPI:
                price_from: float = None, price_to: float = None,
                order: str = "newest_first") -> List[dict]:
         """
-        Recherche sur Vinted via l'API interne.
-        Retourne une liste d'articles avec toutes les infos.
+        Recherche sur Vinted en exécutant fetch() depuis le navigateur.
         """
-        if not self._cookie_refreshed:
-            self._refresh_cookies()
-
+        self._ensure_browser()
         self._rate_limit()
 
-        params = {
-            "search_text": query,
-            "catalog_ids": "",
-            "order": order,
-            "per_page": str(per_page),
-            "page": str(page),
-        }
+        # Construire l'URL
+        params_parts = [
+            f"search_text={quote_plus(query)}",
+            f"order={order}",
+            f"per_page={per_page}",
+            f"page={page}",
+        ]
         if price_from is not None:
-            params["price_from"] = str(price_from)
+            params_parts.append(f"price_from={price_from}")
         if price_to is not None:
-            params["price_to"] = str(price_to)
+            params_parts.append(f"price_to={price_to}")
 
-        max_retries = 2
-        for attempt in range(max_retries + 1):
-            try:
-                resp = self.session.get(
-                    f"{self.API}/catalog/items",
-                    params=params,
-                    headers=self._get_headers(),
-                    timeout=25,
-                )
+        url = f"{self.API}/catalog/items?{'&'.join(params_parts)}"
 
-                if resp.status_code in (401, 403, 429):
-                    self._consecutive_failures += 1
-                    if resp.status_code == 429:
-                        wait = random.uniform(15, 30)
-                        logging.warning(f"[API] Rate limit (429), attente {wait:.0f}s...")
-                        time.sleep(wait)
-                    else:
-                        logging.warning(f"[API] {resp.status_code} — refresh cookies...")
+        try:
+            # Exécuter fetch() dans le contexte du navigateur
+            result = self._page.evaluate("""async (url) => {
+                try {
+                    const resp = await fetch(url, {
+                        credentials: 'include',
+                        headers: {
+                            'Accept': 'application/json, text/plain, */*',
+                        },
+                    });
+                    if (!resp.ok) {
+                        return { error: true, status: resp.status, text: '' };
+                    }
+                    const data = await resp.json();
+                    return { error: false, data: data };
+                } catch(e) {
+                    return { error: true, status: 0, text: e.message };
+                }
+            }""", url)
 
-                    self._cookie_refreshed = False
-                    self._refresh_cookies()
-                    time.sleep(random.uniform(3, 6))
+            if result.get("error"):
+                status = result.get("status", 0)
+                logging.warning(f"[API] Erreur fetch pour '{query}' (status: {status})")
 
-                    if attempt < max_retries:
-                        continue
-                    return []
+                if status in (401, 403):
+                    # Session expirée → relancer le navigateur
+                    logging.info("[API] 🔄 Relance navigateur...")
+                    self.close()
+                    self._ensure_browser()
 
-                content_type = resp.headers.get("Content-Type", "")
-                if "json" not in content_type:
-                    self._consecutive_failures += 1
-                    logging.warning(
-                        f"[API] Réponse non-JSON pour '{query}' "
-                        f"(Content-Type: {content_type}, status: {resp.status_code})"
-                    )
-                    self._cookie_refreshed = False
-                    if attempt < max_retries:
-                        logging.info("[API] 🔄 Réinitialisation session et retry...")
-                        self._refresh_cookies()
-                        time.sleep(random.uniform(4, 8))
-                        continue
-                    return []
-
-                data = resp.json()
-                items = data.get("items", [])
-                self._consecutive_failures = 0
-
-                results = []
-                for item in items:
-                    price_raw = item.get("price") or item.get("total_item_price") or "0"
-                    if isinstance(price_raw, dict):
-                        prix = float(price_raw.get("amount", "0"))
-                    elif isinstance(price_raw, str):
-                        prix = float(price_raw)
-                    else:
-                        prix = float(price_raw or 0)
-
-                    results.append({
-                        "id": str(item.get("id", "")),
-                        "titre": item.get("title", ""),
-                        "prix": prix,
-                        "marque": item.get("brand_title", ""),
-                        "taille": item.get("size_title", ""),
-                        "url": f"{self.BASE}/items/{item.get('id', '')}",
-                        "image_url": (item.get("photo", {}) or {}).get("url", ""),
-                        "etat": item.get("status", ""),
-                        "favori_count": item.get("favourite_count", 0),
-                        "vue_count": item.get("view_count", 0),
-                        "vendeur": (item.get("user", {}) or {}).get("login", ""),
-                        "note_vendeur": float((item.get("user", {}) or {}).get("feedback_reputation", 0) or 0),
-                        "created_at": item.get("created_at_ts", ""),
-                    })
-
-                return results
-
-            except Exception as e:
-                self._consecutive_failures += 1
-                err_name = e.__class__.__name__
-                logging.warning(f"[API] {err_name} pour '{query}' (tentative {attempt + 1}): {e}")
-                self._cookie_refreshed = False
-                if attempt < max_retries:
-                    self._refresh_cookies()
-                    time.sleep(random.uniform(4, 8))
-                    continue
                 return []
+
+            data = result.get("data", {})
+            items = data.get("items", [])
+
+            results = []
+            for item in items:
+                price_raw = item.get("price") or item.get("total_item_price") or "0"
+                if isinstance(price_raw, dict):
+                    prix = float(price_raw.get("amount", "0"))
+                elif isinstance(price_raw, str):
+                    prix = float(price_raw)
+                else:
+                    prix = float(price_raw or 0)
+
+                results.append({
+                    "id": str(item.get("id", "")),
+                    "titre": item.get("title", ""),
+                    "prix": prix,
+                    "marque": item.get("brand_title", ""),
+                    "taille": item.get("size_title", ""),
+                    "url": f"{self.BASE}/items/{item.get('id', '')}",
+                    "image_url": (item.get("photo", {}) or {}).get("url", ""),
+                    "etat": item.get("status", ""),
+                    "favori_count": item.get("favourite_count", 0),
+                    "vue_count": item.get("view_count", 0),
+                    "vendeur": (item.get("user", {}) or {}).get("login", ""),
+                    "note_vendeur": float((item.get("user", {}) or {}).get("feedback_reputation", 0) or 0),
+                    "created_at": item.get("created_at_ts", ""),
+                })
+
+            return results
+
+        except Exception as e:
+            logging.error(f"[API] Erreur recherche '{query}': {e}")
+            # Tenter de relancer le navigateur
+            try:
+                self.close()
+            except Exception:
+                pass
+            self._ready = False
+            return []
+
+    def close(self):
+        """Ferme le navigateur proprement."""
+        try:
+            if self._browser:
+                self._browser.close()
+            if self._playwright:
+                self._playwright.stop()
+        except Exception:
+            pass
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._playwright = None
+        self._ready = False
 
     def search_all_pages(self, query: str, max_items: int = 50,
                          price_from: float = None, price_to: float = None,
@@ -1069,14 +951,19 @@ def main():
     init_db()
     engine = FlipEngine()
 
-    while True:
-        try:
-            engine.scan()
-        except Exception as e:
-            logging.error(f"❌ {e}")
+    try:
+        while True:
+            try:
+                engine.scan()
+            except Exception as e:
+                logging.error(f"❌ {e}")
 
-        logging.info(f"⏳ Prochain scan dans {CONFIG['scan_interval_minutes']} min...")
-        time.sleep(CONFIG["scan_interval_minutes"] * 60)
+            logging.info(f"⏳ Prochain scan dans {CONFIG['scan_interval_minutes']} min...")
+            time.sleep(CONFIG["scan_interval_minutes"] * 60)
+    except KeyboardInterrupt:
+        logging.info("👋 Arrêt demandé, fermeture du navigateur...")
+    finally:
+        engine.api.close()
 
 
 if __name__ == "__main__":
