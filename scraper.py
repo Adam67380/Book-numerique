@@ -157,7 +157,7 @@ class VintedAPI:
             )
 
         # Session curl_cffi qui imite Chrome (empreinte TLS identique)
-        self.session = curl_requests.Session(impersonate="chrome131")
+        self.session = curl_requests.Session(impersonate="chrome131", verify=False)
         self._cookie_refreshed = False
         self._request_count = 0
         self._last_request = 0
