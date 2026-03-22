@@ -32,6 +32,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
 # ═══════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════
@@ -136,34 +142,22 @@ class VintedAPI:
     """
     Client pour l'API interne de Vinted.
 
-    Vinted utilise une API JSON en interne que leur site web appelle.
-    On simule un navigateur qui fait les mêmes requêtes.
-
-    Fix: utilise l'endpoint OAuth guest token pour obtenir un cookie de
-    session valide, au lieu de simplement visiter la page d'accueil
-    (qui est bloquée par Cloudflare/DataDome).
+    Utilise curl_cffi pour imiter l'empreinte TLS d'un vrai navigateur Chrome
+    et contourner la protection Cloudflare.
     """
 
     BASE = "https://www.vinted.fr"
     API = "https://www.vinted.fr/api/v2"
 
-    # User-Agents récents (mars 2026)
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
-    ]
-
     def __init__(self):
-        self.session = requests.Session()
+        if not HAS_CURL_CFFI:
+            raise RuntimeError(
+                "curl_cffi est requis pour contourner Cloudflare.\n"
+                "Installe-le avec : pip install curl_cffi"
+            )
 
-        # Retry automatique (ne PAS retry sur 401/403, on gère manuellement)
-        retry = Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503])
-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
-
-        self._ua = random.choice(self.USER_AGENTS)
+        # Session curl_cffi qui imite Chrome (empreinte TLS identique)
+        self.session = curl_requests.Session(impersonate="chrome131")
         self._cookie_refreshed = False
         self._request_count = 0
         self._last_request = 0
@@ -172,91 +166,63 @@ class VintedAPI:
     def _get_headers(self, accept: str = "application/json, text/plain, */*") -> dict:
         """Headers qui imitent un vrai navigateur."""
         return {
-            "User-Agent": self._ua,
             "Accept": accept,
             "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
             "Referer": f"{self.BASE}/catalog",
             "Origin": self.BASE,
             "DNT": "1",
-            "Connection": "keep-alive",
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
-            "Sec-CH-UA-Platform": '"Windows"',
         }
 
     def _refresh_cookies(self):
         """
-        Récupère les cookies de session en 2 étapes :
-        1. Visite la page d'accueil pour obtenir les cookies de base
-        2. Si ça ne marche pas, essaie /oauth/token pour un guest token
+        Visite la page d'accueil avec curl_cffi (empreinte Chrome)
+        pour obtenir les cookies de session Vinted.
+        Cloudflare laisse passer car le TLS fingerprint est identique à Chrome.
         """
         for attempt in range(3):
             try:
                 self.session.cookies.clear()
 
-                # Étape 1: Visiter la page d'accueil avec des headers navigateur
-                html_headers = self._get_headers(accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                html_headers["Sec-Fetch-Dest"] = "document"
-                html_headers["Sec-Fetch-Mode"] = "navigate"
-                html_headers["Sec-Fetch-Site"] = "none"
-                html_headers["Sec-Fetch-User"] = "?1"
-                html_headers["Upgrade-Insecure-Requests"] = "1"
-
                 resp = self.session.get(
                     self.BASE,
-                    headers=html_headers,
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "fr-FR,fr;q=0.9",
+                        "Sec-Fetch-Dest": "document",
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Site": "none",
+                        "Sec-Fetch-User": "?1",
+                        "Upgrade-Insecure-Requests": "1",
+                    },
                     timeout=30,
                     allow_redirects=True,
                 )
 
-                # Vérifier si on a obtenu un cookie de session
-                cookies = self.session.cookies.get_dict()
+                cookies = dict(self.session.cookies)
                 has_session = any(
-                    k.startswith("_vinted_fr_session") or k == "access_token_web"
+                    k.startswith("_vinted_fr_session") or "access_token" in k
                     for k in cookies
                 )
 
-                if has_session and resp.status_code == 200:
+                if resp.status_code == 200 and has_session:
                     self._cookie_refreshed = True
                     self._consecutive_failures = 0
                     logging.info(f"[API] Cookies rafraîchis ✅ (tentative {attempt + 1})")
                     return
 
-                # Étape 2: Essayer l'endpoint OAuth guest
-                logging.info("[API] Pas de cookie session, tentative OAuth guest...")
-                oauth_resp = self.session.post(
-                    f"{self.BASE}/oauth/token",
-                    json={
-                        "grant_type": "client_credentials",
-                        "client_id": "web",
-                        "scope": "public",
-                    },
-                    headers=self._get_headers(),
-                    timeout=20,
-                )
+                if resp.status_code == 200:
+                    # Page reçue mais pas de cookie session — on tente quand même
+                    self._cookie_refreshed = True
+                    logging.info(f"[API] Page OK, cookies: {list(cookies.keys())}")
+                    return
 
-                if oauth_resp.status_code == 200:
-                    try:
-                        token_data = oauth_resp.json()
-                        access_token = token_data.get("access_token", "")
-                        if access_token:
-                            self.session.headers.update({
-                                "Authorization": f"Bearer {access_token}",
-                            })
-                            self._cookie_refreshed = True
-                            self._consecutive_failures = 0
-                            logging.info("[API] Token OAuth guest obtenu ✅")
-                            return
-                    except Exception:
-                        pass
-
-                # Si les 2 méthodes échouent, attendre et réessayer
                 wait = random.uniform(3, 8) * (attempt + 1)
                 logging.warning(
-                    f"[API] Cookies non obtenus (status={resp.status_code}, "
-                    f"cookies={list(cookies.keys())}), retry dans {wait:.0f}s..."
+                    f"[API] Status {resp.status_code}, cookies={list(cookies.keys())}, "
+                    f"retry dans {wait:.0f}s..."
                 )
                 time.sleep(wait)
 
@@ -265,7 +231,6 @@ class VintedAPI:
                 logging.error(f"[API] Erreur refresh cookies (tentative {attempt + 1}): {e}")
                 time.sleep(wait)
 
-        # Marquer comme rafraîchi même en échec pour ne pas boucler
         self._cookie_refreshed = True
         logging.error("[API] ⚠️ Impossible d'obtenir des cookies valides après 3 tentatives")
 
@@ -275,19 +240,16 @@ class VintedAPI:
         now = time.time()
         elapsed = now - self._last_request
 
-        # Délai de base entre requêtes (plus long si échecs récents)
         if self._consecutive_failures >= 3:
             base_delay = random.uniform(10, 20)
             logging.info(f"[API] Délai rallongé après {self._consecutive_failures} échecs ({base_delay:.0f}s)...")
         else:
             base_delay = random.uniform(2.0, 4.5)
 
-        # Toutes les 15 requêtes, pause longue
         if self._request_count % 15 == 0:
             base_delay = random.uniform(10, 20)
             logging.info(f"[API] Pause anti-ban ({base_delay:.0f}s)...")
 
-        # Toutes les 40 requêtes, refresh cookies
         if self._request_count % 40 == 0:
             self._refresh_cookies()
             base_delay += random.uniform(3, 6)
@@ -332,7 +294,6 @@ class VintedAPI:
                     timeout=25,
                 )
 
-                # Blocage détecté → refresh session
                 if resp.status_code in (401, 403, 429):
                     self._consecutive_failures += 1
                     if resp.status_code == 429:
@@ -350,7 +311,6 @@ class VintedAPI:
                         continue
                     return []
 
-                # Vérifier que c'est bien du JSON avant de parser
                 content_type = resp.headers.get("Content-Type", "")
                 if "json" not in content_type:
                     self._consecutive_failures += 1
@@ -358,7 +318,6 @@ class VintedAPI:
                         f"[API] Réponse non-JSON pour '{query}' "
                         f"(Content-Type: {content_type}, status: {resp.status_code})"
                     )
-                    # Probablement une page HTML anti-bot → refresh session
                     self._cookie_refreshed = False
                     if attempt < max_retries:
                         logging.info("[API] 🔄 Réinitialisation session et retry...")
@@ -373,7 +332,6 @@ class VintedAPI:
 
                 results = []
                 for item in items:
-                    # Extraction du prix — Vinted change parfois le format
                     price_raw = item.get("price") or item.get("total_item_price") or "0"
                     if isinstance(price_raw, dict):
                         prix = float(price_raw.get("amount", "0"))
@@ -400,24 +358,15 @@ class VintedAPI:
 
                 return results
 
-            except requests.exceptions.JSONDecodeError:
+            except Exception as e:
                 self._consecutive_failures += 1
-                logging.warning(f"[API] Réponse non-JSON pour '{query}' (tentative {attempt + 1})")
+                err_name = e.__class__.__name__
+                logging.warning(f"[API] {err_name} pour '{query}' (tentative {attempt + 1}): {e}")
                 self._cookie_refreshed = False
                 if attempt < max_retries:
                     self._refresh_cookies()
                     time.sleep(random.uniform(4, 8))
                     continue
-                return []
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                self._consecutive_failures += 1
-                logging.warning(f"[API] {e.__class__.__name__} pour '{query}' (tentative {attempt + 1})")
-                if attempt < max_retries:
-                    time.sleep(random.uniform(3, 8))
-                    continue
-                return []
-            except Exception as e:
-                logging.error(f"[API] Erreur recherche '{query}': {e}")
                 return []
 
     def search_all_pages(self, query: str, max_items: int = 50,
