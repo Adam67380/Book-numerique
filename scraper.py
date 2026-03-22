@@ -38,6 +38,12 @@ try:
 except ImportError:
     HAS_CURL_CFFI = False
 
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+
 # ═══════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════
@@ -149,17 +155,21 @@ class VintedAPI:
     BASE = "https://www.vinted.fr"
     API = "https://www.vinted.fr/api/v2"
 
-    # Versions d'impersonation à essayer (de la plus récente à la plus ancienne)
     IMPERSONATE_OPTIONS = ["chrome131", "chrome124", "chrome120", "chrome116", "chrome110", "chrome"]
 
     def __init__(self):
         if not HAS_CURL_CFFI:
             raise RuntimeError(
-                "curl_cffi est requis pour contourner Cloudflare.\n"
-                "Installe-le avec : pip install curl_cffi"
+                "curl_cffi est requis. Installe avec : pip install curl_cffi"
+            )
+        if not HAS_PLAYWRIGHT:
+            raise RuntimeError(
+                "playwright est requis pour obtenir les cookies Vinted.\n"
+                "Installe avec :\n"
+                "  pip install playwright\n"
+                "  playwright install chromium"
             )
 
-        # Trouver la meilleure version d'impersonation disponible
         self._impersonate = self._find_working_impersonate()
         logging.info(f"[API] Impersonation: {self._impersonate}")
 
@@ -174,7 +184,6 @@ class VintedAPI:
 
     @classmethod
     def _find_working_impersonate(cls) -> str:
-        """Teste les versions d'impersonation et retourne la première qui marche."""
         for imp in cls.IMPERSONATE_OPTIONS:
             try:
                 s = curl_requests.Session(impersonate=imp, verify=False)
@@ -199,71 +208,77 @@ class VintedAPI:
 
     def _refresh_cookies(self):
         """
-        Obtient les cookies de session Vinted en visitant plusieurs pages.
-        Cloudflare peut bloquer la page d'accueil mais laisser passer
-        d'autres endpoints.
+        Lance un vrai navigateur Chromium via Playwright pour visiter Vinted,
+        passer le challenge Cloudflare, puis récupère les cookies et les
+        transfère dans la session curl_cffi pour les requêtes API rapides.
         """
-        # URLs à essayer dans l'ordre
-        urls_to_try = [
-            (f"{self.BASE}/catalog", "catalog"),
-            (f"{self.BASE}/member/general/new", "login page"),
-            (self.BASE, "page d'accueil"),
-        ]
-
         for attempt in range(3):
             try:
-                # Recréer la session à chaque tentative pour repartir propre
+                logging.info(f"[API] 🌐 Ouverture navigateur pour cookies (tentative {attempt + 1})...")
+
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(
+                        headless=False,  # Visible pour passer Cloudflare
+                        args=[
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-sandbox",
+                        ],
+                    )
+                    context = browser.new_context(
+                        locale="fr-FR",
+                        viewport={"width": 1366, "height": 768},
+                    )
+                    page = context.new_page()
+
+                    # Visiter Vinted
+                    page.goto(self.BASE, wait_until="domcontentloaded", timeout=45000)
+
+                    # Attendre que Cloudflare laisse passer (la page se charge)
+                    logging.info("[API] ⏳ Attente du chargement (Cloudflare)...")
+                    try:
+                        page.wait_for_url("**/vinted.fr/**", timeout=30000)
+                        # Attendre un peu que les cookies se stabilisent
+                        page.wait_for_timeout(3000)
+                    except Exception:
+                        # Timeout OK — on prend les cookies quand même
+                        pass
+
+                    # Récupérer les cookies du navigateur
+                    browser_cookies = context.cookies()
+                    browser.close()
+
+                # Recréer la session curl_cffi avec les cookies du navigateur
                 self.session = curl_requests.Session(
                     impersonate=self._impersonate,
                     verify=False,
                 )
 
-                for url, label in urls_to_try:
-                    resp = self.session.get(
-                        url,
-                        headers={
-                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-                            "Cache-Control": "no-cache",
-                            "Pragma": "no-cache",
-                            "Sec-Fetch-Dest": "document",
-                            "Sec-Fetch-Mode": "navigate",
-                            "Sec-Fetch-Site": "none",
-                            "Sec-Fetch-User": "?1",
-                            "Upgrade-Insecure-Requests": "1",
-                        },
-                        timeout=30,
-                        allow_redirects=True,
+                cookie_names = []
+                for c in browser_cookies:
+                    self.session.cookies.set(
+                        c["name"], c["value"],
+                        domain=c.get("domain", ".vinted.fr"),
+                        path=c.get("path", "/"),
                     )
+                    cookie_names.append(c["name"])
 
-                    cookies = dict(self.session.cookies)
-                    has_session = any(
-                        "_vinted" in k or "access_token" in k or "session" in k.lower()
-                        for k in cookies
-                    )
-
-                    if resp.status_code == 200:
-                        self._cookie_refreshed = True
-                        self._consecutive_failures = 0
-                        if has_session:
-                            logging.info(f"[API] Cookies session obtenus via {label} ✅")
-                        else:
-                            logging.info(f"[API] Page {label} OK (cookies: {list(cookies.keys())})")
-                        return
-
-                    logging.debug(f"[API] {label}: status={resp.status_code}")
-                    time.sleep(random.uniform(1, 3))
-
-                wait = random.uniform(5, 12) * (attempt + 1)
-                logging.warning(
-                    f"[API] Aucune page accessible (tentative {attempt + 1}/3), "
-                    f"retry dans {wait:.0f}s..."
+                has_session = any(
+                    "_vinted" in k or "access_token" in k
+                    for k in cookie_names
                 )
-                time.sleep(wait)
+
+                if has_session:
+                    logging.info(f"[API] ✅ Cookies session Vinted obtenus via navigateur")
+                else:
+                    logging.info(f"[API] ✅ Cookies obtenus: {cookie_names}")
+
+                self._cookie_refreshed = True
+                self._consecutive_failures = 0
+                return
 
             except Exception as e:
-                wait = random.uniform(5, 12) * (attempt + 1)
-                logging.error(f"[API] Erreur refresh cookies (tentative {attempt + 1}): {e}")
+                wait = random.uniform(5, 10) * (attempt + 1)
+                logging.error(f"[API] Erreur navigateur (tentative {attempt + 1}): {e}")
                 time.sleep(wait)
 
         self._cookie_refreshed = True
