@@ -209,8 +209,8 @@ class VintedAPI:
     def _refresh_cookies(self):
         """
         Lance un vrai navigateur Chromium via Playwright pour visiter Vinted,
-        passer le challenge Cloudflare, puis récupère les cookies et les
-        transfère dans la session curl_cffi pour les requêtes API rapides.
+        attendre que le challenge Cloudflare soit RÉSOLU, puis récupérer
+        les vrais cookies de session Vinted.
         """
         for attempt in range(3):
             try:
@@ -218,7 +218,7 @@ class VintedAPI:
 
                 with sync_playwright() as p:
                     browser = p.chromium.launch(
-                        headless=False,  # Visible pour passer Cloudflare
+                        headless=False,
                         args=[
                             "--disable-blink-features=AutomationControlled",
                             "--no-sandbox",
@@ -231,23 +231,60 @@ class VintedAPI:
                     page = context.new_page()
 
                     # Visiter Vinted
-                    page.goto(self.BASE, wait_until="domcontentloaded", timeout=45000)
+                    page.goto(self.BASE, wait_until="domcontentloaded", timeout=60000)
 
-                    # Attendre que Cloudflare laisse passer (la page se charge)
-                    logging.info("[API] ⏳ Attente du chargement (Cloudflare)...")
-                    try:
-                        page.wait_for_url("**/vinted.fr/**", timeout=30000)
-                        # Attendre un peu que les cookies se stabilisent
-                        page.wait_for_timeout(3000)
-                    except Exception:
-                        # Timeout OK — on prend les cookies quand même
-                        pass
+                    # Attendre que le challenge Cloudflare soit résolu
+                    # On attend qu'un élément Vinted apparaisse sur la page
+                    logging.info("[API] ⏳ Attente résolution Cloudflare (jusqu'à 60s)...")
 
-                    # Récupérer les cookies du navigateur
+                    max_wait = 60  # secondes max
+                    poll_interval = 2  # vérifier toutes les 2s
+                    waited = 0
+                    session_ok = False
+
+                    while waited < max_wait:
+                        page.wait_for_timeout(poll_interval * 1000)
+                        waited += poll_interval
+
+                        # Vérifier si on a les cookies de session Vinted
+                        current_cookies = context.cookies()
+                        cookie_names = [c["name"] for c in current_cookies]
+
+                        has_session = any(
+                            "_vinted" in k or "access_token" in k
+                            or "anon_id" in k or "session" in k.lower()
+                            for k in cookie_names
+                        )
+
+                        if has_session:
+                            logging.info(f"[API] ✅ Challenge résolu après {waited}s")
+                            session_ok = True
+                            # Attendre 2s de plus pour que tout se stabilise
+                            page.wait_for_timeout(2000)
+                            break
+
+                        # Vérifier aussi si la page Vinted est chargée
+                        try:
+                            title = page.title()
+                            if "vinted" in title.lower() and "attention" not in title.lower():
+                                logging.info(f"[API] ✅ Page Vinted chargée après {waited}s")
+                                session_ok = True
+                                page.wait_for_timeout(2000)
+                                break
+                        except Exception:
+                            pass
+
+                        if waited % 10 == 0:
+                            logging.info(f"[API] ⏳ Toujours en attente... ({waited}s, cookies: {cookie_names})")
+
+                    if not session_ok:
+                        logging.warning(f"[API] ⏱️ Timeout {max_wait}s — on prend les cookies disponibles")
+
+                    # Récupérer tous les cookies finaux
                     browser_cookies = context.cookies()
                     browser.close()
 
-                # Recréer la session curl_cffi avec les cookies du navigateur
+                # Transférer les cookies dans curl_cffi
                 self.session = curl_requests.Session(
                     impersonate=self._impersonate,
                     verify=False,
@@ -268,13 +305,16 @@ class VintedAPI:
                 )
 
                 if has_session:
-                    logging.info(f"[API] ✅ Cookies session Vinted obtenus via navigateur")
+                    logging.info(f"[API] ✅ Cookies session Vinted transférés")
+                    self._cookie_refreshed = True
+                    self._consecutive_failures = 0
+                    return
                 else:
-                    logging.info(f"[API] ✅ Cookies obtenus: {cookie_names}")
-
-                self._cookie_refreshed = True
-                self._consecutive_failures = 0
-                return
+                    logging.warning(f"[API] ⚠️ Pas de cookie session, seulement: {cookie_names}")
+                    # On continue quand même au cas où ça marche
+                    if attempt == 2:
+                        self._cookie_refreshed = True
+                        return
 
             except Exception as e:
                 wait = random.uniform(5, 10) * (attempt + 1)
