@@ -149,6 +149,9 @@ class VintedAPI:
     BASE = "https://www.vinted.fr"
     API = "https://www.vinted.fr/api/v2"
 
+    # Versions d'impersonation à essayer (de la plus récente à la plus ancienne)
+    IMPERSONATE_OPTIONS = ["chrome131", "chrome124", "chrome120", "chrome116", "chrome110", "chrome"]
+
     def __init__(self):
         if not HAS_CURL_CFFI:
             raise RuntimeError(
@@ -156,12 +159,30 @@ class VintedAPI:
                 "Installe-le avec : pip install curl_cffi"
             )
 
-        # Session curl_cffi qui imite Chrome (empreinte TLS identique)
-        self.session = curl_requests.Session(impersonate="chrome131", verify=False)
+        # Trouver la meilleure version d'impersonation disponible
+        self._impersonate = self._find_working_impersonate()
+        logging.info(f"[API] Impersonation: {self._impersonate}")
+
+        self.session = curl_requests.Session(
+            impersonate=self._impersonate,
+            verify=False,
+        )
         self._cookie_refreshed = False
         self._request_count = 0
         self._last_request = 0
         self._consecutive_failures = 0
+
+    @classmethod
+    def _find_working_impersonate(cls) -> str:
+        """Teste les versions d'impersonation et retourne la première qui marche."""
+        for imp in cls.IMPERSONATE_OPTIONS:
+            try:
+                s = curl_requests.Session(impersonate=imp, verify=False)
+                s.close()
+                return imp
+            except Exception:
+                continue
+        return "chrome"
 
     def _get_headers(self, accept: str = "application/json, text/plain, */*") -> dict:
         """Headers qui imitent un vrai navigateur."""
@@ -178,61 +199,75 @@ class VintedAPI:
 
     def _refresh_cookies(self):
         """
-        Visite la page d'accueil avec curl_cffi (empreinte Chrome)
-        pour obtenir les cookies de session Vinted.
-        Cloudflare laisse passer car le TLS fingerprint est identique à Chrome.
+        Obtient les cookies de session Vinted en visitant plusieurs pages.
+        Cloudflare peut bloquer la page d'accueil mais laisser passer
+        d'autres endpoints.
         """
+        # URLs à essayer dans l'ordre
+        urls_to_try = [
+            (f"{self.BASE}/catalog", "catalog"),
+            (f"{self.BASE}/member/general/new", "login page"),
+            (self.BASE, "page d'accueil"),
+        ]
+
         for attempt in range(3):
             try:
-                self.session.cookies.clear()
-
-                resp = self.session.get(
-                    self.BASE,
-                    headers={
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "fr-FR,fr;q=0.9",
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": "none",
-                        "Sec-Fetch-User": "?1",
-                        "Upgrade-Insecure-Requests": "1",
-                    },
-                    timeout=30,
-                    allow_redirects=True,
+                # Recréer la session à chaque tentative pour repartir propre
+                self.session = curl_requests.Session(
+                    impersonate=self._impersonate,
+                    verify=False,
                 )
 
-                cookies = dict(self.session.cookies)
-                has_session = any(
-                    k.startswith("_vinted_fr_session") or "access_token" in k
-                    for k in cookies
-                )
+                for url, label in urls_to_try:
+                    resp = self.session.get(
+                        url,
+                        headers={
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+                            "Cache-Control": "no-cache",
+                            "Pragma": "no-cache",
+                            "Sec-Fetch-Dest": "document",
+                            "Sec-Fetch-Mode": "navigate",
+                            "Sec-Fetch-Site": "none",
+                            "Sec-Fetch-User": "?1",
+                            "Upgrade-Insecure-Requests": "1",
+                        },
+                        timeout=30,
+                        allow_redirects=True,
+                    )
 
-                if resp.status_code == 200 and has_session:
-                    self._cookie_refreshed = True
-                    self._consecutive_failures = 0
-                    logging.info(f"[API] Cookies rafraîchis ✅ (tentative {attempt + 1})")
-                    return
+                    cookies = dict(self.session.cookies)
+                    has_session = any(
+                        "_vinted" in k or "access_token" in k or "session" in k.lower()
+                        for k in cookies
+                    )
 
-                if resp.status_code == 200:
-                    # Page reçue mais pas de cookie session — on tente quand même
-                    self._cookie_refreshed = True
-                    logging.info(f"[API] Page OK, cookies: {list(cookies.keys())}")
-                    return
+                    if resp.status_code == 200:
+                        self._cookie_refreshed = True
+                        self._consecutive_failures = 0
+                        if has_session:
+                            logging.info(f"[API] Cookies session obtenus via {label} ✅")
+                        else:
+                            logging.info(f"[API] Page {label} OK (cookies: {list(cookies.keys())})")
+                        return
 
-                wait = random.uniform(3, 8) * (attempt + 1)
+                    logging.debug(f"[API] {label}: status={resp.status_code}")
+                    time.sleep(random.uniform(1, 3))
+
+                wait = random.uniform(5, 12) * (attempt + 1)
                 logging.warning(
-                    f"[API] Status {resp.status_code}, cookies={list(cookies.keys())}, "
+                    f"[API] Aucune page accessible (tentative {attempt + 1}/3), "
                     f"retry dans {wait:.0f}s..."
                 )
                 time.sleep(wait)
 
             except Exception as e:
-                wait = random.uniform(3, 8) * (attempt + 1)
+                wait = random.uniform(5, 12) * (attempt + 1)
                 logging.error(f"[API] Erreur refresh cookies (tentative {attempt + 1}): {e}")
                 time.sleep(wait)
 
         self._cookie_refreshed = True
-        logging.error("[API] ⚠️ Impossible d'obtenir des cookies valides après 3 tentatives")
+        logging.error("[API] ⚠️ Impossible d'obtenir des cookies après 3 tentatives")
 
     def _rate_limit(self):
         """Délai adaptatif anti-ban."""
