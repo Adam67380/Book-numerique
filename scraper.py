@@ -208,13 +208,12 @@ class VintedAPI:
 
     def _refresh_cookies(self):
         """
-        Lance un vrai navigateur Chromium via Playwright pour visiter Vinted,
-        attendre que le challenge Cloudflare soit RÉSOLU, puis récupérer
-        les vrais cookies de session Vinted.
+        Lance un navigateur Playwright, visite Vinted, passe Cloudflare,
+        puis extrait les cookies ET le token d'accès depuis le contexte JS.
         """
         for attempt in range(3):
             try:
-                logging.info(f"[API] 🌐 Ouverture navigateur pour cookies (tentative {attempt + 1})...")
+                logging.info(f"[API] 🌐 Ouverture navigateur (tentative {attempt + 1})...")
 
                 with sync_playwright() as p:
                     browser = p.chromium.launch(
@@ -230,66 +229,71 @@ class VintedAPI:
                     )
                     page = context.new_page()
 
-                    # Visiter Vinted
                     page.goto(self.BASE, wait_until="domcontentloaded", timeout=60000)
+                    logging.info("[API] ⏳ Attente résolution Cloudflare...")
 
-                    # Attendre que le challenge Cloudflare soit résolu
-                    # On attend qu'un élément Vinted apparaisse sur la page
-                    logging.info("[API] ⏳ Attente résolution Cloudflare (jusqu'à 60s)...")
-
-                    max_wait = 60  # secondes max
-                    poll_interval = 2  # vérifier toutes les 2s
-                    waited = 0
-                    session_ok = False
-
-                    while waited < max_wait:
-                        page.wait_for_timeout(poll_interval * 1000)
-                        waited += poll_interval
-
-                        # Vérifier si on a les cookies de session Vinted
-                        current_cookies = context.cookies()
-                        cookie_names = [c["name"] for c in current_cookies]
-
-                        has_session = any(
-                            "_vinted" in k or "access_token" in k
-                            or "anon_id" in k or "session" in k.lower()
-                            for k in cookie_names
+                    # Attendre que la vraie page Vinted charge (pas le challenge)
+                    # On cherche un élément du site (barre de recherche, logo, etc.)
+                    try:
+                        page.wait_for_selector(
+                            "a[href*='/catalog'], input[type='search'], [data-testid], .web_ui__Navigation",
+                            timeout=60000,
                         )
+                        logging.info("[API] ✅ Page Vinted chargée")
+                    except Exception:
+                        logging.warning("[API] ⏱️ Timeout en attendant la page Vinted")
 
-                        if has_session:
-                            logging.info(f"[API] ✅ Challenge résolu après {waited}s")
-                            session_ok = True
-                            # Attendre 2s de plus pour que tout se stabilise
-                            page.wait_for_timeout(2000)
-                            break
+                    # Laisser le JS finir de s'exécuter
+                    page.wait_for_timeout(3000)
 
-                        # Vérifier aussi si la page Vinted est chargée
-                        try:
-                            title = page.title()
-                            if "vinted" in title.lower() and "attention" not in title.lower():
-                                logging.info(f"[API] ✅ Page Vinted chargée après {waited}s")
-                                session_ok = True
-                                page.wait_for_timeout(2000)
-                                break
-                        except Exception:
-                            pass
+                    # Extraire le token d'accès depuis le JS / localStorage / cookies
+                    token = page.evaluate("""() => {
+                        // Méthode 1: localStorage
+                        for (let i = 0; i < localStorage.length; i++) {
+                            const key = localStorage.key(i);
+                            if (key && (key.includes('access_token') || key.includes('auth'))) {
+                                try {
+                                    const val = JSON.parse(localStorage.getItem(key));
+                                    if (val && val.access_token) return val.access_token;
+                                    if (typeof val === 'string' && val.length > 20) return val;
+                                } catch(e) {
+                                    const val = localStorage.getItem(key);
+                                    if (val && val.length > 20) return val;
+                                }
+                            }
+                        }
 
-                        if waited % 10 == 0:
-                            logging.info(f"[API] ⏳ Toujours en attente... ({waited}s, cookies: {cookie_names})")
+                        // Méthode 2: meta tags
+                        const meta = document.querySelector('meta[name*="token"], meta[name*="csrf"]');
+                        if (meta) return meta.content;
 
-                    if not session_ok:
-                        logging.warning(f"[API] ⏱️ Timeout {max_wait}s — on prend les cookies disponibles")
+                        // Méthode 3: chercher dans le HTML un token
+                        const scripts = document.querySelectorAll('script');
+                        for (const s of scripts) {
+                            const text = s.textContent || '';
+                            const match = text.match(/"access_token"\\s*:\\s*"([^"]+)"/);
+                            if (match) return match[1];
+                        }
 
-                    # Récupérer tous les cookies finaux
+                        return null;
+                    }""")
+
+                    # Récupérer les cookies
                     browser_cookies = context.cookies()
                     browser.close()
 
-                # Transférer les cookies dans curl_cffi
+                if token:
+                    logging.info(f"[API] 🔑 Token trouvé: {token[:20]}...")
+                else:
+                    logging.info("[API] Pas de token JS, on utilise les cookies seuls")
+
+                # Recréer la session curl_cffi
                 self.session = curl_requests.Session(
                     impersonate=self._impersonate,
                     verify=False,
                 )
 
+                # Transférer les cookies
                 cookie_names = []
                 for c in browser_cookies:
                     self.session.cookies.set(
@@ -299,22 +303,17 @@ class VintedAPI:
                     )
                     cookie_names.append(c["name"])
 
-                has_session = any(
-                    "_vinted" in k or "access_token" in k
-                    for k in cookie_names
-                )
+                logging.info(f"[API] 🍪 Cookies transférés: {cookie_names}")
 
-                if has_session:
-                    logging.info(f"[API] ✅ Cookies session Vinted transférés")
-                    self._cookie_refreshed = True
-                    self._consecutive_failures = 0
-                    return
-                else:
-                    logging.warning(f"[API] ⚠️ Pas de cookie session, seulement: {cookie_names}")
-                    # On continue quand même au cas où ça marche
-                    if attempt == 2:
-                        self._cookie_refreshed = True
-                        return
+                # Si on a un token, l'ajouter aux headers par défaut
+                if token:
+                    self.session.headers.update({
+                        "Authorization": f"Bearer {token}",
+                    })
+
+                self._cookie_refreshed = True
+                self._consecutive_failures = 0
+                return
 
             except Exception as e:
                 wait = random.uniform(5, 10) * (attempt + 1)
